@@ -1,12 +1,11 @@
 """Unattended Coinbase public-market research scanner. No orders or account access.
 
-Writes qualified observations into public.scanner_signal_journal (id text primary key,
-payload jsonb). A separate dashboard must read these observations to display them.
+Qualified observations -> public.scanner_signal_journal.
+Near misses (one or two technical checks failed) -> public.scanner_near_misses.
+Both tables require id text primary key, payload jsonb.
 """
 import argparse
 import hashlib
-import json
-import math
 import os
 import sys
 import time
@@ -16,20 +15,19 @@ from datetime import datetime, timezone
 import requests
 
 BASE = "https://api.exchange.coinbase.com"
-HEADERS = {"User-Agent": "TradingDeskResearchWorker/1.0", "Accept": "application/json"}
-SESSION = requests.Session()
+HEADERS = {"User-Agent": "TradingDeskResearchWorker/1.1", "Accept": "application/json"}
 STABLE = {"USD", "GBP", "USDC", "USDT", "DAI", "EUR", "PYUSD", "TUSD", "FDUSD", "GUSD", "PAX"}
 
 
 def get(path, params=None):
     for attempt in range(4):
         try:
-            r = SESSION.get(BASE + path, params=params, headers=HEADERS, timeout=20)
-            if r.status_code in (429, 500, 502, 503, 504):
+            response = requests.get(BASE + path, params=params, headers=HEADERS, timeout=20)
+            if response.status_code in (429, 500, 502, 503, 504):
                 time.sleep(2 ** attempt)
                 continue
-            r.raise_for_status()
-            return r.json()
+            response.raise_for_status()
+            return response.json()
         except requests.RequestException:
             if attempt == 3:
                 raise
@@ -48,25 +46,27 @@ def ema(values, span):
 def rsi(values, period=14):
     if len(values) < period + 2:
         return None
-    changes = [values[i] - values[i-1] for i in range(1, len(values))]
-    avg_gain = sum(max(v, 0) for v in changes[:period]) / period
-    avg_loss = sum(max(-v, 0) for v in changes[:period]) / period
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    gain = sum(max(v, 0) for v in changes[:period]) / period
+    loss = sum(max(-v, 0) for v in changes[:period]) / period
     for change in changes[period:]:
-        avg_gain = (avg_gain * (period - 1) + max(change, 0)) / period
-        avg_loss = (avg_loss * (period - 1) + max(-change, 0)) / period
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
-    return 100 - 100 / (1 + avg_gain / avg_loss)
+        gain = (gain * (period - 1) + max(change, 0)) / period
+        loss = (loss * (period - 1) + max(-change, 0)) / period
+    if loss == 0:
+        return 100.0 if gain > 0 else 50.0
+    return 100 - 100 / (1 + gain / loss)
 
 
 def candles(pair, granularity):
     raw = get(f"/products/{pair}/candles", {"granularity": granularity})
     now = time.time()
-    rows = sorted((v for v in raw if len(v) >= 6 and float(v[0]) + granularity <= now), key=lambda v: v[0])
-    return rows
+    return sorted(
+        (v for v in raw if len(v) >= 6 and float(v[0]) + granularity <= now),
+        key=lambda v: v[0],
+    )
 
 
-def indicators(rows):
+def indicators(rows, granularity):
     if len(rows) < 60:
         return None
     closes = [float(x[4]) for x in rows]
@@ -76,27 +76,44 @@ def indicators(rows):
     price = closes[-1]
     e20, e50 = ema(closes, 20), ema(closes, 50)
     strength = rsi(closes)
-    if not price > 0 or strength is None:
+    if price <= 0 or strength is None:
         return None
-    trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])) for i in range(1, len(rows))]
+    trs = [
+        max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+        for i in range(1, len(rows))
+    ]
     atr = sum(trs[-14:]) / 14
     previous_vol = sorted(volumes[-21:-1])
     median = (previous_vol[9] + previous_vol[10]) / 2
-    relative_volume = volumes[-1] / median if median > 0 else 0
-    return {"price": price, "ema20": e20, "ema50": e50, "rsi": strength,
-            "atr": atr, "rvol": relative_volume, "uptrend": price > e20 > e50,
-            "breakout": price > max(highs[-21:-1]) and relative_volume >= 1.5,
-            "support": min(lows[-11:-1]), "candle_utc": datetime.fromtimestamp(rows[-1][0], timezone.utc).isoformat(),
-            "age_minutes": (time.time() - (float(rows[-1][0]) + (rows[-1][0] - rows[-2][0]))) / 60}
+    rvol = volumes[-1] / median if median > 0 else 0
+    return {
+        "price": price, "ema20": e20, "ema50": e50, "rsi": strength,
+        "atr": atr, "rvol": rvol, "uptrend": price > e20 > e50,
+        "breakout": price > max(highs[-21:-1]) and rvol >= 1.5,
+        "support": min(lows[-11:-1]),
+        "candle_utc": datetime.fromtimestamp(float(rows[-1][0]), timezone.utc).isoformat(),
+        "age_minutes": (time.time() - (float(rows[-1][0]) + granularity)) / 60,
+    }
 
 
 def inspect(pair, fee_rate, max_spread):
-    hour = indicators(candles(pair, 3600))
-    day = indicators(candles(pair, 86400))
+    hour = indicators(candles(pair, 3600), 3600)
+    day = indicators(candles(pair, 86400), 86400)
     if not hour or not day or hour["age_minutes"] > 120 or day["age_minutes"] > 2880:
         return None
-    if not (hour["uptrend"] and day["uptrend"] and 50 <= hour["rsi"] < 72 and 48 <= day["rsi"] < 75 and hour["breakout"]):
+
+    # These are the original five technical requirements. Do not relax them.
+    checks = {
+        "1h uptrend": hour["uptrend"],
+        "1d uptrend": day["uptrend"],
+        "1h RSI 50-72": 50 <= hour["rsi"] < 72,
+        "1d RSI 48-75": 48 <= day["rsi"] < 75,
+        "1h breakout with RVOL >= 1.5": hour["breakout"],
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if len(failed) > 2:
         return None
+
     ticker = get(f"/products/{pair}/ticker")
     bid, ask = float(ticker.get("bid") or 0), float(ticker.get("ask") or 0)
     if bid <= 0 or ask < bid:
@@ -104,39 +121,69 @@ def inspect(pair, fee_rate, max_spread):
     spread = (ask - bid) / ((ask + bid) / 2)
     if spread > max_spread:
         return None
+
     entry = ask
     stop = min(entry - 1.5 * hour["atr"], hour["support"] - 0.1 * hour["atr"])
     if stop <= 0 or stop >= entry:
         return None
-    # Indicative 3R gross target. Does not assert executable liquidity at target.
     target = entry + 3 * (entry - stop)
     net_risk = (entry - stop) / entry + fee_rate + fee_rate * stop / entry
     net_reward = (target - entry) / entry - fee_rate - fee_rate * target / entry
     rr = net_reward / net_risk if net_risk > 0 else -1
     if rr < 1.5 or net_reward <= 0:
         return None
-    signal_id = hashlib.sha256(f"worker-v1|{pair}|{hour['candle_utc']}".encode()).hexdigest()[:32]
-    return {"ID": signal_id, "Observed UTC": datetime.now(timezone.utc).isoformat(), "Pair": pair,
-            "Strategy": "1h breakout + daily trend (worker v1)", "Signal candle UTC": hour["candle_utc"],
+
+    observed = datetime.now(timezone.utc).isoformat()
+    if not failed:
+        signal_id = hashlib.sha256(f"worker-v1|{pair}|{hour['candle_utc']}".encode()).hexdigest()[:32]
+        signal = {
+            "ID": signal_id, "Observed UTC": observed, "Pair": pair,
+            "Strategy": "1h breakout + daily trend (worker v1)",
+            "Signal candle UTC": hour["candle_utc"],
             "Entry": entry, "Stop": stop, "Target": target, "Size GBP": 0,
             "Entry fee rate": fee_rate, "Exit fee rate": fee_rate,
             "Outcome": "OPEN", "Outcome UTC": "", "Net GBP": "", "R multiple": "",
-            "Net R:R estimate": round(rr, 3), "Spread %": round(100*spread, 3),
+            "Net R:R estimate": round(rr, 3), "Spread %": round(100 * spread, 3),
             "1h RSI": round(hour["rsi"], 1), "1d RSI": round(day["rsi"], 1),
             "1h RVOL": round(hour["rvol"], 2), "Source": "Coinbase Exchange public API",
-            "Note": "Paper observation only; no order placed. Outcome tracking not yet implemented."}
+            "Note": "Paper observation only; no order placed. Outcome tracking not yet implemented.",
+        }
+        return "signal", signal
+
+    # Near misses are research observations only, never trade instructions.
+    near_id = hashlib.sha256(f"near-v1|{pair}|{hour['candle_utc']}".encode()).hexdigest()[:32]
+    near = {
+        "ID": near_id, "Type": "NEAR_MISS", "Observed UTC": observed,
+        "Pair": pair, "Strategy": "1h breakout + daily trend (research near miss)",
+        "Signal candle UTC": hour["candle_utc"],
+        "Passed checks": [name for name, passed in checks.items() if passed],
+        "Failed checks": failed, "Checks passed": len(checks) - len(failed),
+        "Checks total": len(checks), "1h RSI": round(hour["rsi"], 1),
+        "1d RSI": round(day["rsi"], 1), "1h RVOL": round(hour["rvol"], 2),
+        "Spread %": round(100 * spread, 3), "Entry fee rate": fee_rate,
+        "Exit fee rate": fee_rate, "Net R:R estimate": round(rr, 3),
+        "Indicative entry": entry, "Indicative stop": stop, "Indicative target": target,
+        "Outcome": "NOT_A_TRADE", "Source": "Coinbase Exchange public API",
+        "Note": "Research only. Technical entry criteria not met. No order placed.",
+    }
+    return "near", near
 
 
-def persist(signal):
+def persist(table, record):
     url = os.environ["SUPABASE_URL"].rstrip("/")
     key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-    if not url.startswith("https://"):
+    if not url.startswith("https://") or "your-project" in url:
         raise RuntimeError("Invalid SUPABASE_URL")
-    r = requests.post(url + "/rest/v1/scanner_signal_journal?on_conflict=id",
-                      headers={"apikey": key, "Authorization": "Bearer " + key,
-                               "Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates,return=minimal"},
-                      json={"id": signal["ID"], "payload": signal}, timeout=20)
-    r.raise_for_status()
+    response = requests.post(
+        f"{url}/rest/v1/{table}?on_conflict=id",
+        headers={
+            "apikey": key, "Authorization": "Bearer " + key,
+            "Content-Type": "application/json",
+            "Prefer": "resolution=ignore-duplicates,return=minimal",
+        },
+        json={"id": record["ID"], "payload": record}, timeout=20,
+    )
+    response.raise_for_status()
 
 
 def main():
@@ -145,19 +192,29 @@ def main():
     parser.add_argument("--limit", type=int, default=30)
     args = parser.parse_args()
     limit = max(1, min(60, args.limit))
-    if not args.dry_run and not all(os.environ.get(k) for k in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY")):
+    if not args.dry_run and not all(
+        os.environ.get(k) for k in ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY")
+    ):
         raise RuntimeError("GitHub Actions secrets SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required")
+
     products = get("/products")
-    pairs = [p["id"] for p in products if p.get("quote_currency") == "USD" and
-             p.get("base_currency") not in STABLE and p.get("status") == "online" and
-             not any(p.get(flag, False) for flag in ("trading_disabled", "cancel_only", "limit_only", "post_only"))]
+    pairs = [
+        p["id"] for p in products
+        if p.get("quote_currency") == "USD"
+        and p.get("base_currency") not in STABLE
+        and p.get("status") == "online"
+        and not any(p.get(flag, False) for flag in
+                    ("trading_disabled", "cancel_only", "limit_only", "post_only"))
+    ]
+
     def turnover(pair):
         data = get(f"/products/{pair}/stats")
         return pair, float(data.get("volume") or 0) * float(data.get("last") or 0)
+
     liquidity = []
     errors = 0
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(turnover, p) for p in pairs]
+        futures = [pool.submit(turnover, pair) for pair in pairs]
         for future in as_completed(futures):
             try:
                 pair, amount = future.result()
@@ -165,25 +222,36 @@ def main():
                     liquidity.append((pair, amount))
             except Exception:
                 errors += 1
-    chosen = [p for p, _ in sorted(liquidity, key=lambda x: x[1], reverse=True)[:limit]]
+
+    chosen = [pair for pair, _ in sorted(liquidity, key=lambda x: x[1], reverse=True)[:limit]]
     print(f"Universe={len(pairs)} liquid={len(liquidity)} selected={len(chosen)} liquidity_errors={errors}", flush=True)
-    found = []
+    qualified, near_misses = [], []
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {pool.submit(inspect, pair, .005, .005): pair for pair in chosen}
         for future in as_completed(futures):
             try:
-                signal = future.result()
-                if signal:
-                    found.append(signal)
+                result = future.result()
+                if result:
+                    kind, record = result
+                    (qualified if kind == "signal" else near_misses).append(record)
             except Exception as exc:
                 errors += 1
-                print(f"Market {futures[future]} failed: {type(exc).__name__}")
-    print(f"Qualified={len(found)} request_errors={errors}")
-    for signal in found:
-        print(f"Signal {signal['Pair']} {signal['Strategy']} net_RR={signal['Net R:R estimate']}")
+                print(f"Market {futures[future]} failed: {type(exc).__name__}", flush=True)
+
+    # Limit database growth: store at most 10 near misses per run, best technical matches first.
+    near_misses.sort(key=lambda x: (-x["Checks passed"], -x["Net R:R estimate"], x["Pair"]))
+    near_misses = near_misses[:10]
+    print(f"Qualified={len(qualified)} near_misses={len(near_misses)} request_errors={errors}", flush=True)
+    for signal in qualified:
+        print(f"Signal {signal['Pair']} net_RR={signal['Net R:R estimate']}", flush=True)
         if not args.dry_run:
-            persist(signal)
-    print("DRY RUN complete" if args.dry_run else "Scan and persistence complete")
+            persist("scanner_signal_journal", signal)
+    for near in near_misses:
+        print(f"Near miss {near['Pair']} failed={'; '.join(near['Failed checks'])}", flush=True)
+        if not args.dry_run:
+            persist("scanner_near_misses", near)
+
+    print("DRY RUN complete" if args.dry_run else "Scan and persistence complete", flush=True)
     if not chosen or errors > max(10, len(pairs) // 3):
         sys.exit("Too many market errors or no markets selected")
 
