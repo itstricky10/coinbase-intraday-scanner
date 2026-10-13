@@ -1,186 +1,262 @@
-import io
+"""Coinbase spot-market research scanner. No authenticated endpoints or order placement."""
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import time
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
 BASE = 'https://api.exchange.coinbase.com'
-HEADERS = {'User-Agent': 'IntradayResearchScanner/3.0', 'Accept': 'application/json'}
-DEFAULT = ['BTC-USD', 'ETH-USD', 'XRP-USD', 'SOL-USD', 'DOGE-USD', 'ADA-USD', 'AVAX-USD', 'LINK-USD']
+HEADERS = {'User-Agent': 'SpotResearchScanner/4.0', 'Accept': 'application/json'}
 
-st.set_page_config(page_title='Spot Scanner V3', layout='wide', initial_sidebar_state='collapsed')
-st.markdown('''<style>.block-container{padding-top:1rem;padding-bottom:3rem;max-width:1050px}h1{font-size:1.7rem!important}.stButton>button{min-height:44px;border-radius:12px}@media(max-width:650px){.block-container{padding-left:.65rem;padding-right:.65rem}}</style>''', unsafe_allow_html=True)
-st.title('⚡ Spot Scanner V3')
-st.caption('Coinbase Exchange public data • educational research • spot long setups only • no orders placed')
+st.set_page_config(page_title='Spot Scanner V4', layout='wide', initial_sidebar_state='collapsed')
+st.markdown('''<style>.block-container{padding-top:1rem;padding-bottom:3rem;max-width:1050px}h1{font-size:1.7rem!important}@media(max-width:650px){.block-container{padding-left:.65rem;padding-right:.65rem}}</style>''', unsafe_allow_html=True)
+st.title('⚡ Spot Scanner V4 — Broad Market')
+st.caption('Coinbase Exchange public endpoints · research only · no trade execution · exchange listings can differ from Coinbase Advanced')
+
+def fetch(path, params=None):
+    for attempt in range(3):
+        try:
+            r = requests.get(BASE + path, params=params, headers=HEADERS, timeout=14)
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException:
+            if attempt == 2:
+                raise
+            time.sleep(0.6 * (attempt + 1))
+
+@st.cache_data(ttl=900, show_spinner=False)
+def products():
+    raw = fetch('/products')
+    if not isinstance(raw, list):
+        raise ValueError('Unexpected Coinbase products response')
+    output = []
+    for p in raw:
+        pid = str(p.get('id', ''))
+        quote = p.get('quote_currency')
+        base = p.get('base_currency')
+        if (quote in ('USD', 'GBP') and pid == f'{base}-{quote}'
+                and p.get('status', 'online') == 'online'
+                and not p.get('trading_disabled', False)
+                and not p.get('cancel_only', False)
+                and not p.get('limit_only', False)
+                and base not in ('USD','GBP','USDC','USDT','DAI','EUR','PYUSD','TUSD','FDUSD','GUSD','PAX')):
+            output.append(pid)
+    return sorted(set(output))
+
+@st.cache_data(ttl=600, show_spinner=False)
+def stats(pair):
+    x = fetch(f'/products/{pair}/stats')
+    volume, last = float(x.get('volume', 0) or 0), float(x.get('last', 0) or 0)
+    return {'Pair': pair, '24h turnover (quote)': volume * last, '24h volume': volume}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def candles(pair, seconds):
+    raw = fetch(f'/products/{pair}/candles', {'granularity': seconds})
+    if not isinstance(raw, list) or not raw:
+        raise ValueError('No candle data')
+    d = pd.DataFrame(raw, columns=['time','low','high','open','close','volume'])
+    for c in ('time','low','high','open','close','volume'):
+        d[c] = pd.to_numeric(d[c], errors='coerce')
+    d = d.dropna().sort_values('time').drop_duplicates('time')
+    now = datetime.now(timezone.utc).timestamp()
+    d = d.loc[d.time + seconds <= now].copy().reset_index(drop=True)
+    d['utc'] = pd.to_datetime(d.time, unit='s', utc=True)
+    return d
 
 @st.cache_data(ttl=45, show_spinner=False)
-def candles(pair, seconds):
-    response = requests.get(f'{BASE}/products/{pair}/candles', params={'granularity': seconds}, headers=HEADERS, timeout=15)
-    response.raise_for_status()
-    raw = response.json()
-    if not isinstance(raw, list) or not raw:
-        raise ValueError(f'No candles returned: {raw}')
-    frame = pd.DataFrame(raw, columns=['time', 'low', 'high', 'open', 'close', 'volume'])
-    for field in ['low', 'high', 'open', 'close', 'volume']:
-        frame[field] = pd.to_numeric(frame[field], errors='coerce')
-    frame = frame.dropna().sort_values('time').drop_duplicates('time').reset_index(drop=True)
-    frame['utc'] = pd.to_datetime(frame['time'], unit='s', utc=True)
-    # Remove the active candle based on its actual timestamp, not merely its position.
-    now = datetime.now(timezone.utc).timestamp()
-    return frame.loc[frame['time'] + seconds <= now].copy().reset_index(drop=True)
-
-@st.cache_data(ttl=30, show_spinner=False)
 def ticker(pair):
-    response = requests.get(f'{BASE}/products/{pair}/ticker', headers=HEADERS, timeout=12)
-    response.raise_for_status()
-    return response.json()
+    return fetch(f'/products/{pair}/ticker')
 
-
-def indicators(frame):
-    d = frame.copy()
+def analyse(d):
     if len(d) < 60:
-        raise ValueError('Need at least 60 completed candles')
-    close = d['close']
-    d['ema20'] = close.ewm(span=20, adjust=False).mean()
-    d['ema50'] = close.ewm(span=50, adjust=False).mean()
+        raise ValueError('Fewer than 60 completed candles')
+    close = d.close
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    ratio = gain / loss.replace(0, np.nan)
-    d['rsi'] = 100 - 100 / (1 + ratio)
-    d.loc[(loss == 0) & (gain > 0), 'rsi'] = 100
-    d.loc[(loss == 0) & (gain == 0), 'rsi'] = 50
-    previous_close = close.shift()
-    tr = pd.concat([d['high'] - d['low'], (d['high'] - previous_close).abs(), (d['low'] - previous_close).abs()], axis=1).max(axis=1)
-    d['atr'] = tr.rolling(14).mean()
-    # Crypto trades 24/7: anchor VWAP at 00:00 UTC, not the arbitrary fetch boundary.
-    day = d['utc'].dt.floor('D')
-    typical = (d['high'] + d['low'] + d['close']) / 3
-    numerator = (typical * d['volume']).groupby(day).cumsum()
-    denominator = d['volume'].groupby(day).cumsum().replace(0, np.nan)
-    d['vwap'] = numerator / denominator
-    last = d.iloc[-1]
-    previous20 = d.iloc[-21:-1]
-    median_volume = float(previous20['volume'].median())
-    rvol = float(last['volume'] / median_volume) if median_volume > 0 else 0.0
-    prior_high = float(previous20['high'].max())
-    prior_low = float(previous20['low'].min())
-    breakout = bool(last['close'] > prior_high and rvol >= 1.5)
-    sweep = bool(last['low'] < prior_low and last['close'] > prior_low and last['close'] > last['open'] and rvol >= 1.2)
-    trend = bool(last['close'] > last['ema20'] > last['ema50'])
-    momentum = bool(pd.notna(last['vwap']) and last['close'] > last['vwap'] and 50 < last['rsi'] < 75)
-    score = (30 if breakout else 0) + (25 if rvol >= 1.5 else 12 if rvol >= 1.1 else 0) + (20 if sweep else 0) + (15 if trend else 0) + (10 if momentum else 0)
-    # A setup requires price confirmation AND trend/momentum context.
-    confirmed = (breakout or sweep) and trend and momentum
-    signal = 'SETUP' if confirmed and score >= 65 else ('AVOID' if last['close'] < last['ema50'] and last['rsi'] < 45 else 'WAIT')
-    atr = float(last['atr'])
-    entry = float(last['close'])
-    # Indicative, not executable orders. Prefer structural support when it is closer.
-    support = float(d['low'].iloc[-11:-1].min())
-    stop = min(entry - 1.5 * atr, support - 0.1 * atr)
-    target = entry + 2 * (entry - stop)
-    return d, dict(last=entry, rvol=rvol, rsi=float(last['rsi']), atr=atr, vwap=float(last['vwap']) if pd.notna(last['vwap']) else np.nan, trend=trend, breakout=breakout, sweep=sweep, score=score, signal=signal, entry=entry, stop=stop, target=target, candle_utc=last['utc'].isoformat())
+    rsi = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+    rsi = rsi.mask((loss == 0) & (gain > 0), 100).mask((loss == 0) & (gain == 0), 50)
+    previous = close.shift()
+    tr = pd.concat([d.high-d.low, (d.high-previous).abs(), (d.low-previous).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
+    day = d.utc.dt.floor('D')
+    typical = (d.high+d.low+d.close)/3
+    vwap = (typical*d.volume).groupby(day).cumsum() / d.volume.groupby(day).cumsum().replace(0, np.nan)
+    last, prior = d.iloc[-1], d.iloc[-21:-1]
+    price = float(last.close)
+    rv = float(last.volume / prior.volume.median()) if prior.volume.median() > 0 else 0.0
+    high, low = float(prior.high.max()), float(prior.low.min())
+    breakout = bool(price > high and rv >= 1.5)
+    sweep = bool(last.low < low and price > low and price > last.open and rv >= 1.2)
+    trend = bool(price > ema20.iloc[-1] > ema50.iloc[-1])
+    momentum = bool(pd.notna(vwap.iloc[-1]) and price > vwap.iloc[-1] and 50 < rsi.iloc[-1] < 75)
+    score = (30 if breakout else 0) + (25 if rv >= 1.5 else 12 if rv >= 1.1 else 0) + (20 if sweep else 0) + (15 if trend else 0) + (10 if momentum else 0)
+    signal = 'SETUP' if (breakout or sweep) and trend and momentum and score >= 65 else ('AVOID' if price < ema50.iloc[-1] and rsi.iloc[-1] < 45 else 'WAIT')
+    a = float(atr.iloc[-1]); support = float(d.low.iloc[-11:-1].min())
+    stop = min(price - 1.5*a, support - 0.1*a)
+    target = price + 2*(price-stop)
+    if not np.isfinite([price, a, stop, target]).all() or stop <= 0 or a <= 0:
+        raise ValueError('Invalid volatility or trade levels')
+    return {'Signal': signal, 'Score': score, 'Last close': price, 'RVOL': round(rv, 2), 'RSI': round(float(rsi.iloc[-1]), 1),
+            'VWAP': float(vwap.iloc[-1]) if pd.notna(vwap.iloc[-1]) else np.nan,
+            'ATR': a, 'Breakout': breakout, 'Sweep': sweep, 'Uptrend': trend,
+            'Entry': price, 'Stop': stop, 'Target': target, 'Candle UTC': last.utc.isoformat()}
 
-with st.expander('⚙️ Markets, fees & risk settings'):
-    raw = st.text_area('Coinbase Exchange pairs (one per line)', '\n'.join(DEFAULT), height=170)
-    pairs = list(dict.fromkeys(x.strip().upper() for x in raw.splitlines() if x.strip()))[:20]
-    interval = st.selectbox('Signal timeframe', ['5 minutes', '15 minutes', '1 hour'], index=0)
-    seconds = {'5 minutes': 300, '15 minutes': 900, '1 hour': 3600}[interval]
-    maker = st.number_input('Maker fee per side (%) — verify your actual tier', 0.0, 5.0, 0.25, 0.05)
-    taker = st.number_input('Taker fee per side (%) — verify your actual tier', 0.0, 5.0, 0.50, 0.05)
-    entry_type = st.selectbox('Entry order type', ['Taker', 'Maker'])
-    exit_type = st.selectbox('Exit order type', ['Taker', 'Maker'])
-    capital = st.number_input('Account capital (GBP)', min_value=1.0, value=100.0, step=10.0)
-    max_risk = st.number_input('Maximum planned loss per trade (GBP)', min_value=0.1, value=2.0, step=0.5)
-    st.caption('Fees are unverified assumptions. GBP-equivalent estimates exclude FX costs and slippage.')
+with st.expander('⚙️ Scan settings', expanded=False):
+    quotes = st.multiselect('Quote markets', ['USD','GBP'], default=['USD','GBP'])
+    timeframe = st.selectbox('Signal timeframe', ['5 minutes','15 minutes','1 hour'], index=0)
+    seconds = {'5 minutes':300,'15 minutes':900,'1 hour':3600}[timeframe]
+    scan_limit = st.slider('Top liquid markets to analyse', 10, 100, 50, step=10)
+    min_turnover = st.number_input('Minimum 24h turnover in quote currency', min_value=0.0, value=100000.0, step=50000.0)
+    max_spread = st.number_input('Maximum spread (%)', min_value=0.0, max_value=10.0, value=0.50, step=0.05)
+    maker = st.number_input('Maker fee per side (%) — verify with Coinbase', 0.0, 5.0, 0.25, 0.05)
+    taker = st.number_input('Taker fee per side (%) — verify with Coinbase', 0.0, 5.0, 0.50, 0.05)
+    entry_type = st.selectbox('Entry fee type', ['Taker','Maker'])
+    exit_type = st.selectbox('Exit fee type', ['Taker','Maker'])
+    capital = st.number_input('Capital (GBP)', min_value=1.0, value=100.0, step=10.0)
+    max_risk = st.number_input('Maximum planned loss (GBP)', min_value=0.1, value=2.0, step=0.5)
+    st.caption('USD and GBP turnover figures are NOT directly comparable; the scanner ranks within each quote market before combining candidates. Fee defaults are provisional.')
 
-refresh = st.button('🔄 Refresh market scan', type='primary', use_container_width=True)
-settings_key = (tuple(pairs), seconds)
-if 'scan' not in st.session_state or refresh or st.session_state.get('scan_settings') != settings_key:
-    results, errors = [], []
-    with st.spinner('Scanning completed Coinbase candles…'):
-        for pair in pairs:
+refresh = st.button('🔄 Refresh broad market scan', type='primary', use_container_width=True)
+key = (tuple(sorted(quotes)), seconds, scan_limit, min_turnover, max_spread, maker, taker, entry_type, exit_type)
+
+if refresh or 'scan' not in st.session_state or st.session_state.get('settings_key') != key:
+    errors, rows = [], []
+    with st.spinner('Discovering available spot pairs…'):
+        try:
+            universe = [p for p in products() if p.rsplit('-', 1)[-1] in quotes]
+        except Exception as exc:
+            st.error(f'Could not discover markets: {exc}')
+            st.stop()
+    st.caption(f'Discovered {len(universe)} eligible spot pairs. Checking 24-hour activity; this can take a little while on the first scan.')
+    # Fetch activity across the entire discovered universe, not an alphabetically truncated subset.
+    activity = []
+    with st.spinner('Ranking markets by 24-hour turnover…'):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(stats, p): p for p in universe}
+            for future in as_completed(futures):
+                try:
+                    s = future.result()
+                    if s['24h turnover (quote)'] >= min_turnover:
+                        activity.append(s)
+                except Exception as exc:
+                    errors.append(f"Activity {futures[future]}: {exc}")
+    if not activity:
+        st.error('No markets passed the turnover filter. Lower the minimum or try again.')
+        st.stop()
+    activity_df = pd.DataFrame(activity)
+    # Allocate half of slots to each selected quote currency, then fill from remaining turnover leaders.
+    chosen = []
+    if len(quotes) == 2:
+        for q in quotes:
+            candidates = activity_df[activity_df.Pair.str.endswith('-'+q)].nlargest(scan_limit//2, '24h turnover (quote)')
+            chosen.extend(candidates.Pair.tolist())
+    else:
+        chosen = activity_df.nlargest(scan_limit, '24h turnover (quote)').Pair.tolist()
+    # Fill unused slots (quote turnovers are not FX-normalised; only used for overflow).
+    for p in activity_df.sort_values('24h turnover (quote)', ascending=False).Pair:
+        if len(chosen) >= scan_limit:
+            break
+        if p not in chosen:
+            chosen.append(p)
+    entry_rate = (maker if entry_type == 'Maker' else taker)/100
+    exit_rate = (maker if exit_type == 'Maker' else taker)/100
+    progress = st.progress(0, text='Analysing completed candles…')
+    def inspect(pair):
+        result = analyse(candles(pair, seconds))
+        t = ticker(pair)
+        bid, ask = float(t.get('bid') or 0), float(t.get('ask') or 0)
+        spread = (ask-bid)/((ask+bid)/2)*100 if bid>0 and ask>0 and ask>=bid else np.nan
+        result['Pair'] = pair
+        result['Spread %'] = round(spread, 3) if np.isfinite(spread) else np.nan
+        risk_pct = (result['Entry']-result['Stop'])/result['Entry'] + entry_rate + exit_rate*result['Stop']/result['Entry']
+        profit_pct = (result['Target']-result['Entry'])/result['Entry'] - entry_rate - exit_rate*result['Target']/result['Entry']
+        notional = min(capital/(1+entry_rate), max_risk/risk_pct) if risk_pct > 0 else 0
+        result['Position GBP equivalent'] = round(notional, 2)
+        result['Planned loss GBP'] = round(notional*risk_pct, 2)
+        result['Target profit GBP'] = round(notional*profit_pct, 2)
+        result['Net R:R'] = round(profit_pct/risk_pct, 2) if risk_pct > 0 else np.nan
+        result['Trade filter'] = ('REVIEW' if result['Signal']=='SETUP' and np.isfinite(spread)
+                                  and spread <= max_spread and profit_pct > 0 and result['Net R:R'] >= 1.5 else 'NO TRADE')
+        return result
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(inspect, p): p for p in chosen}
+        for i, future in enumerate(as_completed(futures), 1):
             try:
-                _, m = indicators(candles(pair, seconds))
-                t = ticker(pair)
-                bid, ask = float(t.get('bid') or 0), float(t.get('ask') or 0)
-                spread = (ask - bid) / ((ask + bid) / 2) * 100 if bid > 0 and ask > 0 else np.nan
-                results.append({'Pair': pair, 'Signal': m['signal'], 'Score /100': m['score'], 'Last close': m['last'], 'RVOL': round(m['rvol'], 2), 'RSI': round(m['rsi'], 1), 'Spread %': round(spread, 3), 'VWAP': m['vwap'], 'ATR': m['atr'], 'Breakout': m['breakout'], 'Sweep': m['sweep'], 'Uptrend': m['trend'], 'Indicative entry': m['entry'], 'Indicative stop': m['stop'], 'Indicative target': m['target'], 'Candle UTC': m['candle_utc']})
+                rows.append(future.result())
             except Exception as exc:
-                errors.append(f'{pair}: {exc}')
-    st.session_state.scan = pd.DataFrame(results).sort_values('Score /100', ascending=False) if results else pd.DataFrame()
+                errors.append(f"Candles {futures[future]}: {exc}")
+            progress.progress(i/len(futures), text=f'Analysed {i}/{len(futures)} markets')
+    progress.empty()
+    st.session_state.scan = pd.DataFrame(rows).sort_values(['Trade filter','Score','RVOL'], ascending=[False,False,False]) if rows else pd.DataFrame()
     st.session_state.errors = errors
-    st.session_state.scan_settings = settings_key
+    st.session_state.settings_key = key
     st.session_state.scanned_at = datetime.now(timezone.utc).isoformat()
+    st.session_state.discovered = len(universe)
+    st.session_state.activity_count = len(activity)
 
-if st.session_state.errors:
-    st.warning('Some markets failed: ' + ' | '.join(st.session_state.errors))
 scan = st.session_state.scan
 if scan.empty:
-    st.error('No usable data returned. Check pair symbols and Coinbase availability.')
+    st.error('No usable markets. Try refreshing or reducing the filters.')
     st.stop()
-st.caption(f"Scan fetched: {st.session_state.scanned_at} · {interval} candles · refresh manually")
+if st.session_state.errors:
+    st.warning(f'{len(st.session_state.errors)} requests failed. Results may be incomplete.')
+    with st.expander('Show request errors'):
+        st.write(st.session_state.errors)
+st.caption(f"Fetched {st.session_state.scanned_at} · {timeframe} · {len(scan)} analysed / {st.session_state.discovered} discovered · {st.session_state.activity_count} above volume filter")
+
+setup_count = int((scan.Signal == 'SETUP').sum())
+review_count = int((scan['Trade filter'] == 'REVIEW').sum())
+up_count = int(scan.Uptrend.sum())
+a,b,c,d = st.columns(4)
+a.metric('Analysed', len(scan))
+b.metric('Uptrends', up_count)
+c.metric('Technical setups', setup_count)
+d.metric('Review candidates', review_count)
+st.caption('Breadth is based on analysed liquid markets, not the entire crypto market. REVIEW is a screening result, not an instruction to trade.')
+
 st.subheader('📊 Ranked opportunities')
-for _, row in scan.head(8).iterrows():
+for _, r in scan.sort_values(['Trade filter','Score','RVOL'], ascending=[False,False,False]).head(12).iterrows():
     with st.container(border=True):
-        left, right = st.columns([3, 1])
+        left,right = st.columns([3,1])
         with left:
-            st.markdown(f"**{row['Pair']}** · {int(row['Score /100'])}/100")
-            st.caption(f"RVOL {row['RVOL']}× · RSI {row['RSI']} · Spread {row['Spread %']}%")
+            st.markdown(f"**{r['Pair']}** · score {int(r['Score'])}/100")
+            st.caption(f"RVOL {r['RVOL']}× · RSI {r['RSI']} · spread {r['Spread %']}% · net R:R {r['Net R:R']}:1")
         with right:
-            st.markdown({'SETUP': '🟢 **SETUP**', 'WAIT': '🟡 **WAIT**', 'AVOID': '🔴 **AVOID**'}[row['Signal']])
-st.caption('SETUP means rules passed, NOT a recommendation to buy. WAIT and AVOID are filters, not sell signals.')
-with st.expander('Full sortable data'):
+            st.markdown('🟢 **REVIEW**' if r['Trade filter']=='REVIEW' else '🟡 **WAIT**' if r['Signal']=='WAIT' else '🔴 **NO TRADE**')
+with st.expander('Full market table', expanded=False):
     st.dataframe(scan, use_container_width=True, hide_index=True)
 
-st.subheader('📥 Share an analysis report')
+st.subheader('📥 Export analysis')
 report = scan.copy()
 report.insert(0, 'Scan fetched UTC', st.session_state.scanned_at)
-report.insert(1, 'Timeframe', interval)
+report.insert(1, 'Timeframe', timeframe)
 report.insert(2, 'Maker fee assumption %', maker)
 report.insert(3, 'Taker fee assumption %', taker)
-st.download_button('Download market analysis CSV', data=report.to_csv(index=False).encode('utf-8'), file_name='coinbase_scanner_v3_report.csv', mime='text/csv', use_container_width=True)
-st.caption('Upload this CSV in our ChatGPT conversation for a second-pass review. It contains public market data only.')
+report.insert(4, 'Account capital GBP', capital)
+report.insert(5, 'Risk limit GBP', max_risk)
+st.download_button('Download V4 market analysis CSV', report.to_csv(index=False).encode('utf-8'),
+                   file_name='coinbase_scanner_v4_report.csv', mime='text/csv', use_container_width=True)
 
-pair = st.selectbox('Inspect market', scan['Pair'].tolist())
-d, m = indicators(candles(pair, seconds))
-st.subheader(f'{pair} — completed candles')
-st.line_chart(d.set_index('utc')[['close', 'ema20', 'ema50', 'vwap']], height=310)
-st.bar_chart(d.set_index('utc')[['volume']], height=140)
-st.caption(f"Indicative long levels: entry {m['entry']:.8g} · stop {m['stop']:.8g} · target {m['target']:.8g} (quote currency). Not live executable quotes.")
+pair = st.selectbox('Inspect market', scan.Pair.tolist())
+try:
+    detail = candles(pair, seconds).copy()
+    detail['EMA20'] = detail.close.ewm(span=20, adjust=False).mean()
+    detail['EMA50'] = detail.close.ewm(span=50, adjust=False).mean()
+    st.subheader(f'{pair} — completed candles')
+    st.line_chart(detail.set_index('utc')[['close','EMA20','EMA50']], height=290)
+    st.bar_chart(detail.set_index('utc')[['volume']], height=130)
+    item = scan.loc[scan.Pair==pair].iloc[0]
+    st.write(f"**Indicative long levels:** entry {item['Entry']:.8g} · stop {item['Stop']:.8g} · target {item['Target']:.8g} (quote currency)")
+    st.write(f"**At current fee assumptions:** notional £{item['Position GBP equivalent']:.2f} · planned loss £{item['Planned loss GBP']:.2f} · target profit £{item['Target profit GBP']:.2f} · net R:R {item['Net R:R']}:1")
+except Exception as exc:
+    st.warning(f'Could not render chart: {exc}')
 
-st.subheader('🎯 Fee-adjusted trade calculator')
-entry = st.number_input('Entry price (quote currency)', min_value=0.00000001, value=float(m['entry']), format='%.8f')
-stop = st.number_input('Stop price', min_value=0.00000001, value=max(0.00000001, float(m['stop'])), format='%.8f')
-target = st.number_input('Target price', min_value=0.00000001, value=float(m['target']), format='%.8f')
-entry_rate = (maker if entry_type == 'Maker' else taker) / 100
-exit_rate = (maker if exit_type == 'Maker' else taker) / 100
-if not (stop < entry < target):
-    st.error('Spot long setup requires stop < entry < target.')
-else:
-    risk_pct = (entry - stop) / entry + entry_rate + exit_rate * stop / entry
-    profit_pct = (target - entry) / entry - entry_rate - exit_rate * target / entry
-    # Reserve entry fee from capital; risk includes exit fee at the stop.
-    notional = min(capital / (1 + entry_rate), max_risk / risk_pct)
-    risk, reward = notional * risk_pct, notional * profit_pct
-    rr = reward / risk if risk > 0 else 0
-    a, b = st.columns(2)
-    a.metric('Position notional (GBP equivalent)', f'£{notional:.2f}')
-    b.metric('Cash needed incl. entry fee', f'£{notional * (1 + entry_rate):.2f}')
-    c, e, f = st.columns(3)
-    c.metric('Planned loss incl. fees', f'£{risk:.2f}')
-    e.metric('Target gain incl. fees', f'£{reward:.2f}')
-    f.metric('Net reward/risk', f'{rr:.2f}:1')
-    if profit_pct <= 0:
-        st.error('Target does not cover estimated fees.')
-    elif rr < 1.5:
-        st.warning('Net reward/risk below 1.5:1. Consider rejecting the setup.')
-    else:
-        st.info('Reward/risk threshold passed; signal and execution still require independent confirmation.')
-    st.caption('Assumes full fills at entered prices. Excludes spread beyond selected entry/exit, slippage, FX conversion, tax and minimum order sizes. Stops can execute worse than planned.')
-
-st.subheader('🗒️ Manual trading journal')
-template = pd.DataFrame(columns=['entry_time_utc', 'exit_time_utc', 'pair', 'side', 'quantity', 'entry_price', 'exit_price', 'entry_fee_gbp', 'exit_fee_gbp', 'fx_cost_gbp', 'realised_pnl_gbp', 'setup', 'notes'])
-st.download_button('Download journal CSV template', template.to_csv(index=False).encode(), file_name='trade_journal.csv', mime='text/csv')
-st.info('Public Coinbase Exchange snapshots are not Coinbase Advanced live quotes. Verify market availability, spreads and your own fee tier before any order. No automatic trading.')
+st.info('No trades are executed. The report uses historical candles and public ticker snapshots, not executable Coinbase Advanced quotes. Fee tiers, conversion charges, order minimums, slippage and spread may change the result. A stop order does not guarantee the planned exit price. USD and GBP figures use GBP-equivalent position budgets, not an actual FX conversion.')
