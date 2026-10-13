@@ -8,20 +8,28 @@ import requests
 import streamlit as st
 
 BASE = 'https://api.exchange.coinbase.com'
-HEADERS = {'User-Agent': 'SpotResearchScanner/5.0', 'Accept': 'application/json'}
-st.set_page_config(page_title='Spot Scanner V5 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
+HEADERS = {'User-Agent': 'SpotResearchScanner/5.1', 'Accept': 'application/json'}
+st.set_page_config(page_title='Spot Scanner V5.1 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
 st.markdown('''<style>
 .stApp{background:linear-gradient(160deg,#09131e 0%,#0b1522 55%,#101c2c 100%);color:#eaf2fa}
 .block-container{max-width:1220px;padding-top:1.1rem;padding-bottom:3rem}
 h1,h2,h3{letter-spacing:-.035em} h1{font-size:2rem!important}
 [data-testid="stMetric"]{background:#132437;border:1px solid #274158;border-radius:15px;padding:12px}
-[data-testid="stMetricLabel"]{color:#a5bfd0}[data-testid="stMetricValue"]{font-size:1.55rem}
+[data-testid="stMetricLabel"]{color:#a5bfd0}[data-testid="stMetricValue"]{font-size:1.3rem}
 [data-testid="stVerticalBlockBorderWrapper"]{border-color:#294156!important;border-radius:16px!important}
 .stButton>button,.stDownloadButton>button{border-radius:12px;min-height:45px;font-weight:650}
 .stTabs [data-baseweb="tab-list"]{gap:4px;overflow-x:auto}.stTabs [data-baseweb="tab"]{border-radius:10px;padding:8px 12px}
-@media(max-width:650px){.block-container{padding-left:.7rem;padding-right:.7rem}h1{font-size:1.6rem!important}h2{font-size:1.25rem!important}[data-testid="stMetricValue"]{font-size:1.2rem}}
+@media(max-width:650px){
+.block-container{padding:2.8rem .7rem 2rem!important}
+h1{font-size:1.5rem!important;line-height:1.25!important}h2{font-size:1.22rem!important}
+[data-testid="stMetric"]{padding:7px 9px!important;border-radius:10px!important;min-height:0!important}
+[data-testid="stMetricLabel"]{font-size:.75rem!important}
+[data-testid="stMetricValue"]{font-size:1.12rem!important;line-height:1.15!important}
+[data-testid="stHorizontalBlock"]{gap:.45rem!important}
+.stTabs [data-baseweb="tab"]{padding:7px 8px!important;font-size:.85rem!important}
+}
 </style>''', unsafe_allow_html=True)
-st.title('⚡ SPOT SCANNER V5')
+st.title('⚡ SPOT SCANNER V5.1')
 st.caption('TRADING DESK  /  COINBASE PUBLIC MARKETS  /  RESEARCH ONLY — NO ORDERS')
 
 
@@ -254,7 +262,9 @@ b.metric('👀 Watchlist', watch)
 c, d = st.columns(2)
 c.metric('📈 15m uptrends', f'{up}/{len(scan)}')
 d.metric('⏱️ Stale feeds', stale)
-st.caption('Review = passed screening rules, not a buy recommendation. Market breadth covers the selected liquid pairs only.')
+breadth = 100 * up / len(scan) if len(scan) else 0
+st.progress(min(100, int(breadth)), text=f'15m bullish breadth: {breadth:.0f}% of analysed markets')
+st.caption('Breadth covers only scanned liquid pairs; REVIEW is not a buy recommendation.')
 
 tab1, tab2, tab3 = st.tabs(['🏆 RANKINGS', '🔎 CHART LAB', '📥 REPORT'])
 with tab1:
@@ -269,7 +279,7 @@ with tab1:
             with left:
                 st.markdown(f"**{r['Pair']}**  ·  {int(r['Score 5m'])}/100")
                 st.caption(f"5m RSI {r['5m RSI']} · 15m RSI {r['15m RSI']} · RVOL {r['RVOL 5m']}×")
-                st.caption(f"Spread {r['Spread %']}% · Net R:R {r['Net R:R']}:1 · 15m {'↑' if r['15m uptrend'] else '↓'}")
+                st.caption(f"Close {r.Entry:.8g} · Spread {r['Spread %']}% · Net R:R {r['Net R:R']}:1 · 15m {'↑' if r['15m uptrend'] else '↓'}")
             with right:
                 st.markdown({'REVIEW':'🟢 **REVIEW**','WATCH':'🟡 **WATCH**','AVOID':'🔴 **AVOID**','STALE':'⚪ **STALE**'}[r.Status])
     with st.expander('All markets · sortable detailed table'):
@@ -279,6 +289,9 @@ with tab2:
     st.subheader('Chart lab')
     pair = st.selectbox('Choose a market', scan.Pair.tolist())
     r = scan.loc[scan.Pair == pair].iloc[0]
+    chart_window = st.segmented_control('Chart window', ['6h', '12h', '24h', 'All'], default='12h', key='chart_window')
+    overlays = st.toggle('Show indicative entry, stop and target', value=True)
+    st.caption(f"Signal: {r.Status} · 5m score: {r['Score 5m']}/100 · 15m RSI: {r['15m RSI']}")
     with st.container(border=True):
         st.markdown(f"### {pair}  ·  {r.Status}")
         st.write('**Why it passed or failed:** ' + r.Why)
@@ -287,6 +300,13 @@ with tab2:
         try:
             d, _ = analyse(candles(pair, secs), secs)
             st.markdown(f'**{tf}**')
+            if chart_window != 'All':
+                hours = {'6h': 6, '12h': 12, '24h': 24}[chart_window]
+                cutoff = d.utc.max() - pd.Timedelta(hours=hours)
+                d = d.loc[d.utc >= cutoff].copy()
+            if len(d) < 2:
+                st.info('Not enough candles in the selected chart window.')
+                continue
             # Plotly is bundled with Streamlit's standard installation, but listed explicitly in requirements for portability.
             import plotly.graph_objects as go
             from plotly.subplots import make_subplots
@@ -296,7 +316,19 @@ with tab2:
             for name, color in [('EMA20', '#4ba8ff'), ('EMA50', '#ffc66d'), ('VWAP', '#c98fff')]:
                 fig.add_trace(go.Scatter(x=d.utc, y=d[name], mode='lines', name=name, line=dict(color=color, width=1.5)), row=1, col=1)
             fig.add_trace(go.Bar(x=d.utc, y=d.volume, name='Volume', marker_color='#436d85'), row=2, col=1)
-            fig.update_layout(height=440, margin=dict(l=4, r=4, t=15, b=5), paper_bgcolor='#101d2b',
+            # Levels are derived from the 5m setup; on 15m they remain reference levels only.
+            if overlays and np.isfinite([r.Entry, r.Stop, r.Target]).all():
+                for label, level, color in [('Entry', r.Entry, '#54c5ff'), ('Stop', r.Stop, '#ff6481'), ('Target', r.Target, '#3be0ac')]:
+                    fig.add_hline(y=float(level), line_color=color, line_dash='dot', line_width=1,
+                                  annotation_text=label, annotation_position='top left', row=1, col=1)
+            if len(d) >= 12:
+                resistance = float(d.high.iloc[-12:-1].max())
+                support = float(d.low.iloc[-12:-1].min())
+                fig.add_hline(y=resistance, line_color='#f5bc6d', line_dash='dash', line_width=1,
+                              annotation_text='Recent resistance', annotation_position='bottom left', row=1, col=1)
+                fig.add_hline(y=support, line_color='#9fb2c6', line_dash='dash', line_width=1,
+                              annotation_text='Recent support', annotation_position='bottom left', row=1, col=1)
+            fig.update_layout(height=390, margin=dict(l=4, r=4, t=15, b=5), paper_bgcolor='#101d2b',
                               plot_bgcolor='#101d2b', font=dict(color='#dce8f2'),
                               legend=dict(orientation='h', y=1.04, x=0), xaxis_rangeslider_visible=False)
             fig.update_xaxes(showgrid=False)
@@ -305,16 +337,13 @@ with tab2:
         except Exception as exc:
             st.warning(f'Chart unavailable: {exc}')
     st.subheader('Indicative trade plan · long only')
-    p1, p2, p3 = st.columns(3)
-    p1.metric('Entry', f"{r.Entry:.8g}")
-    p2.metric('Stop', f"{r.Stop:.8g}")
-    p3.metric('Target', f"{r.Target:.8g}")
+    st.markdown(f"**Entry:** `{r.Entry:.8g}`　 **Stop:** `{r.Stop:.8g}`　 **Target:** `{r.Target:.8g}`")
     x, y = st.columns(2)
     x.metric('Position (£ equivalent)', f"£{r['Position GBP']:.2f}")
     y.metric('Net reward/risk', f"{r['Net R:R']}:1")
-    x2, y2 = st.columns(2)
-    x2.metric('Planned loss', f"£{r['Planned loss GBP']:.2f}")
-    y2.metric('Potential gain', f"£{r['Target gain GBP']:.2f}")
+    st.caption(f"Estimated loss **£{r['Planned loss GBP']:.2f}** · Estimated target gain **£{r['Target gain GBP']:.2f}** (after assumed trading fees, before FX/slippage)")
+    if r.Status != 'REVIEW':
+        st.warning('Not a confirmed setup. ' + str(r.Why))
     st.caption('Levels are based on completed 5m candles, not current executable quotes. GBP-equivalent budget assumes FX conversion without costs; estimates exclude additional slippage, FX fees, taxes and order minimums. Stops may fill worse.')
 
 with tab3:
@@ -325,8 +354,8 @@ with tab3:
     report.insert(2, 'Taker fee assumption %', taker)
     report.insert(3, 'Capital GBP', capital)
     report.insert(4, 'Risk budget GBP', max_risk)
-    st.download_button('⬇️ DOWNLOAD V5 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
-                       file_name='coinbase_scanner_v5_report.csv', mime='text/csv', use_container_width=True)
+    st.download_button('⬇️ DOWNLOAD V5.1 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
+                       file_name='coinbase_scanner_v5_1_report.csv', mime='text/csv', use_container_width=True)
     st.caption('Download the CSV and attach it in our conversation. No account keys or personal data are exported.')
     with st.expander('What do the labels mean?'):
         st.markdown('**REVIEW:** a fresh 5m trigger, 15m confirmation, acceptable spread and estimated net reward/risk. **WATCH:** incomplete confirmation. **AVOID:** bearish conditions. **STALE:** candle data is too old. None of these labels guarantees a trade outcome.')
