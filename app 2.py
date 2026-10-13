@@ -648,3 +648,103 @@ def live_dashboard():
 
 
 live_dashboard()
+
+# ===== V6.4 READ-ONLY AUTOMATED RESEARCH PANEL =====
+# Paste this entire section AFTER the existing live_dashboard() call.
+# It does not write to Supabase or change the existing V6.3 scanner.
+st.divider()
+st.header('📡 AUTOMATED RESEARCH · V6.4')
+st.caption('Unattended GitHub worker observations · read-only Supabase view · not executed trades')
+
+if not db_config():
+    st.warning('Supabase secrets are not configured in Streamlit. Automated results cannot be displayed.')
+else:
+    @st.cache_data(ttl=120, show_spinner=False)
+    def v64_read_table(table_name, limit=500):
+        # Allowlist table names; never interpolate user input into a REST path.
+        if table_name not in ('scanner_signal_journal', 'scanner_near_misses'):
+            raise ValueError('Unknown research table')
+        return db_request('GET', table_name, params={
+            'select': 'id,payload,created_at',
+            'order': 'created_at.desc',
+            'limit': limit,
+        }) or []
+
+    if st.button('🔄 REFRESH AUTOMATED RESULTS', use_container_width=True, key='v64_refresh'):
+        v64_read_table.clear()
+
+    try:
+        saved_signals = v64_read_table('scanner_signal_journal')
+        saved_near_misses = v64_read_table('scanner_near_misses')
+
+        def v64_frame(rows):
+            flattened = []
+            for item in rows:
+                payload = item.get('payload')
+                if not isinstance(payload, dict):
+                    continue
+                flattened.append({
+                    'Saved UTC': item.get('created_at'),
+                    'ID': item.get('id'),
+                    **payload,
+                })
+            return pd.DataFrame(flattened)
+
+        signal_frame = v64_frame(saved_signals)
+        near_frame = v64_frame(saved_near_misses)
+        if not signal_frame.empty and 'Outcome' in signal_frame.columns:
+            outcome = signal_frame['Outcome'].fillna('').astype(str).str.upper()
+            open_count = int((outcome == 'OPEN').sum())
+            target_count = int((outcome == 'TARGET').sum())
+            stop_count = int((outcome == 'STOP').sum())
+        else:
+            open_count = target_count = stop_count = 0
+
+        a, b, c, d = st.columns(4)
+        a.metric('Near misses', len(near_frame))
+        b.metric('Open signals', open_count)
+        c.metric('Targets', target_count)
+        d.metric('Stops', stop_count)
+
+        resolved_count = target_count + stop_count
+        if resolved_count:
+            st.caption(f'Observed target rate: {100 * target_count / resolved_count:.1f}% across {resolved_count} resolved observations. Not a validated win rate.')
+        else:
+            st.info('No resolved paper outcomes yet. The unattended worker will check qualifying signals on future runs.')
+
+        if not signal_frame.empty and {'Outcome', 'Net GBP'}.issubset(signal_frame.columns):
+            resolved = signal_frame.loc[signal_frame['Outcome'].astype(str).str.upper().isin(['TARGET', 'STOP'])]
+            sized = resolved.loc[pd.to_numeric(resolved.get('Size GBP', pd.Series(index=resolved.index, dtype=float)), errors='coerce').fillna(0) > 0]
+            if not sized.empty:
+                net = pd.to_numeric(sized['Net GBP'], errors='coerce').dropna()
+                if not net.empty:
+                    st.metric('Illustrative net P/L (sized observations only)', f'£{net.sum():.2f}')
+            else:
+                st.caption('No £ P/L shown: worker-generated observations have no allocated position size.')
+
+        auto_tab, misses_tab = st.tabs(['📒 AUTOMATED SIGNALS', '🟠 NEAR MISSES'])
+        with auto_tab:
+            if signal_frame.empty:
+                st.info('No stored qualifying signals yet.')
+            else:
+                wanted = ['Saved UTC', 'Pair', 'Strategy', 'Outcome', 'Observed UTC',
+                          'Entry', 'Stop', 'Target', 'Net GBP', 'R multiple']
+                st.dataframe(signal_frame[[x for x in wanted if x in signal_frame.columns]],
+                             use_container_width=True, hide_index=True)
+        with misses_tab:
+            if near_frame.empty:
+                st.info('No stored near misses yet.')
+            else:
+                # Worker versions may use different reason-field names.
+                wanted = ['Saved UTC', 'Pair', 'Strategy', 'Failed gate', 'Failed gates',
+                          'failed', 'reason', 'Reason', 'Why', '1h RSI', 'RSI', 'rsi']
+                display = [x for x in wanted if x in near_frame.columns]
+                if len(display) < 3:
+                    display = near_frame.columns.tolist()
+                st.dataframe(near_frame[display], use_container_width=True, hide_index=True)
+                with st.expander('View complete near-miss records'):
+                    st.dataframe(near_frame, use_container_width=True, hide_index=True)
+        st.caption('Showing up to 500 latest records per table. Coinbase candle history, fees, spread, FX and slippage limit outcome accuracy.')
+    except Exception as exc:
+        st.error(f'Unable to load automated research records: {exc}')
+# ===== END V6.4 PANEL =====
