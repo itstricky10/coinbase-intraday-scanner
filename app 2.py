@@ -1,4 +1,4 @@
-"""Coinbase Spot Scanner V5. Public-data research tool; does not execute trades."""
+"""Coinbase Spot Scanner V6. Public-data research tool; does not execute trades."""
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import time
@@ -8,8 +8,8 @@ import requests
 import streamlit as st
 
 BASE = 'https://api.exchange.coinbase.com'
-HEADERS = {'User-Agent': 'SpotResearchScanner/5.2', 'Accept': 'application/json'}
-st.set_page_config(page_title='Spot Scanner V5.2 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
+HEADERS = {'User-Agent': 'SpotResearchScanner/6.0', 'Accept': 'application/json'}
+st.set_page_config(page_title='Spot Scanner V6 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
 st.markdown('''<style>
 .stApp{background:linear-gradient(160deg,#09131e 0%,#0b1522 55%,#101c2c 100%);color:#eaf2fa}
 .block-container{max-width:1220px;padding-top:2.2rem;padding-bottom:3rem}
@@ -29,8 +29,8 @@ h1{font-size:1.5rem!important;line-height:1.25!important}h2{font-size:1.22rem!im
 .stTabs [data-baseweb="tab"]{padding:7px 8px!important;font-size:.85rem!important}
 }
 </style>''', unsafe_allow_html=True)
-st.title('⚡ SPOT SCANNER V5.2')
-st.caption('TRADING DESK  /  COINBASE PUBLIC MARKETS  /  RESEARCH ONLY — NO ORDERS')
+st.title('⚡ TRADING DESK V6')
+st.caption('COINBASE SPOT · EARLY + CONFIRMED SETUPS · RESEARCH ONLY')
 
 
 def fetch(path, params=None):
@@ -137,6 +137,7 @@ with st.expander('⚙️ SCANNER SETTINGS · markets, fees and risk'):
         scan_limit = st.slider('Markets to scan', 10, 100, 50, step=10)
         min_turnover = st.number_input('Minimum 24h turnover (quote currency)', min_value=0., value=100000., step=50000.)
         max_spread = st.number_input('Maximum spread (%)', min_value=0., max_value=10., value=.5, step=.05)
+        use_higher = st.toggle('Include 1h / 4h / daily context', value=True, help='Extra API requests; scans take longer.')
     with q2:
         maker = st.number_input('Maker fee per side (%) — verify account', 0., 5., .25, .05)
         taker = st.number_input('Taker fee per side (%) — verify account', 0., 5., .50, .05)
@@ -150,7 +151,7 @@ refresh = st.button('🔄  SCAN NOW', type='primary', use_container_width=True)
 
 @st.fragment(run_every='5min')
 def live_dashboard():
-    key = (tuple(sorted(quotes)), scan_limit, min_turnover, max_spread, maker, taker, entry_type, exit_type, capital, max_risk)
+    key = (tuple(sorted(quotes)), scan_limit, min_turnover, max_spread, use_higher, maker, taker, entry_type, exit_type, capital, max_risk)
     if refresh or 'scan' not in st.session_state or st.session_state.get('key') != key or time.time() - st.session_state.get('scan_epoch', 0) >= 300:
         if not quotes:
             st.error('Select at least one quote currency.')
@@ -189,6 +190,24 @@ def live_dashboard():
         er = (maker if entry_type == 'Maker' else taker) / 100
         xr = (maker if exit_type == 'Maker' else taker) / 100
 
+        def higher_context(pair):
+            if not use_higher:
+                return {'1h trend': None, '4h trend': None, '1d trend': None, 'Higher TF': 'OFF'}
+            hourly = candles(pair, 3600)
+            _, h1 = analyse(hourly, 3600)
+            # Coinbase Exchange does not support native 4h granularity. Aggregate completed 1h bars.
+            four = (hourly.set_index('utc').resample('4h', origin='epoch')
+                    .agg({'time':'first', 'open':'first', 'high':'max', 'low':'min', 'close':'last', 'volume':'sum'})
+                    .dropna(subset=['open', 'high', 'low', 'close']).reset_index())
+            # The last group may contain fewer than four hourly candles; only use complete 4h groups.
+            counts = hourly.set_index('utc').resample('4h', origin='epoch').size().to_numpy()
+            four = four.loc[counts == 4].reset_index(drop=True)
+            _, h4 = analyse(four, 14400)
+            _, day = analyse(candles(pair, 86400), 86400)
+            flags = [h1['trend'], h4['trend'], day['trend']]
+            return {'1h trend': flags[0], '4h trend': flags[1], '1d trend': flags[2],
+                    'Higher TF': f"1h {'UP' if flags[0] else 'DOWN'} · 4h {'UP' if flags[1] else 'DOWN'} · 1d {'UP' if flags[2] else 'DOWN'}"}
+
         def inspect(pair):
             _, fast = analyse(candles(pair, 300), 300)
             _, slow = analyse(candles(pair, 900), 900)
@@ -197,6 +216,7 @@ def live_dashboard():
             spread = 100 * (ask - bid) / ((ask + bid) / 2) if bid > 0 and ask >= bid else np.nan
             fresh = fast['age'] <= 10 and slow['age'] <= 30
             aligned = slow['trend'] and slow['momentum'] and 45 <= slow['rsi'] < 75
+            higher = higher_context(pair)
             triggered = (fast['breakout'] or fast['sweep']) and fast['trend'] and fast['momentum']
             risk_pct = (fast['entry'] - fast['stop']) / fast['entry'] + er + xr * fast['stop'] / fast['entry']
             profit_pct = (fast['target'] - fast['entry']) / fast['entry'] - er - xr * fast['target'] / fast['entry']
@@ -204,8 +224,15 @@ def live_dashboard():
             rr = profit_pct / risk_pct if risk_pct > 0 else np.nan
             eligible = (fresh and aligned and triggered and np.isfinite(spread) and spread <= max_spread
                         and profit_pct > 0 and rr >= 1.5 and fast['rsi'] < 75)
-            status = ('REVIEW' if eligible else 'STALE' if not fresh else 'AVOID' if fast['bearish'] or slow['bearish']
-                      else 'WATCH')
+            # Early entries deliberately do NOT require the 15m trend to be fully aligned.
+            # They still require a fresh candle, a volume-backed trigger, acceptable spread,
+            # a positive net payoff and a controlled stop. They are not buy instructions.
+            early = (fresh and not eligible and (fast['breakout'] or fast['sweep'])
+                     and fast['rvol'] >= 1.2 and 40 <= fast['rsi'] < 75
+                     and np.isfinite(spread) and spread <= max_spread
+                     and profit_pct > 0 and np.isfinite(rr) and rr >= 1.2)
+            status = ('CONFIRMED' if eligible else 'AGGRESSIVE' if early else 'STALE' if not fresh
+                      else 'AVOID' if fast['bearish'] or slow['bearish'] else 'WATCH')
             reasons = []
             if not fresh: reasons.append('Candle data stale')
             if not triggered: reasons.append('No confirmed 5m trigger')
@@ -213,8 +240,11 @@ def live_dashboard():
             if not np.isfinite(spread) or spread > max_spread: reasons.append('Spread unavailable/too wide')
             if not np.isfinite(rr) or rr < 1.5 or profit_pct <= 0: reasons.append('Net reward/risk insufficient')
             if fast['rsi'] >= 75: reasons.append('5m RSI overextended')
-            if eligible: reasons.append('All screening rules passed; verify live execution')
-            return {'Pair': pair, 'Status': status, 'Score 5m': fast['score'], '5m RSI': round(fast['rsi'], 1),
+            if eligible: reasons = ['Confirmed 5m trigger + 15m alignment; verify live execution']
+            elif early: reasons = ['Early volume-backed 5m trigger; 15m confirmation NOT required; higher risk']
+            if use_higher and higher['Higher TF'] != 'OFF':
+                reasons.append(higher['Higher TF'])
+            return {'Pair': pair, 'Status': status, **higher, 'Score 5m': fast['score'], '5m RSI': round(fast['rsi'], 1),
                     '15m RSI': round(slow['rsi'], 1), 'RVOL 5m': round(fast['rvol'], 2),
                     '5m uptrend': fast['trend'], '15m uptrend': slow['trend'], '15m aligned': aligned,
                     'Breakout': fast['breakout'], 'Sweep': fast['sweep'], 'Spread %': round(spread, 3),
@@ -226,7 +256,7 @@ def live_dashboard():
                     '5m candle UTC': fast['candle'], '15m candle UTC': slow['candle'],
                     'Why': '; '.join(reasons)}
 
-        progress = st.progress(0, text='Running 5m and 15m analysis…')
+        progress = st.progress(0, text='Scanning 5m / 15m and higher-timeframe context…')
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(inspect, p): p for p in chosen}
             for i, future in enumerate(as_completed(futures), 1):
@@ -248,7 +278,7 @@ def live_dashboard():
     if scan.empty:
         st.error('No markets returned. Check request errors or try refreshing.')
         st.stop()
-    rank = {'REVIEW': 0, 'WATCH': 1, 'AVOID': 2, 'STALE': 3}
+    rank = {'CONFIRMED': 0, 'AGGRESSIVE': 1, 'WATCH': 2, 'AVOID': 3, 'STALE': 4}
     scan = scan.assign(_rank=scan.Status.map(rank)).sort_values(['_rank', 'Score 5m', 'RVOL 5m'], ascending=[True, False, False]).drop(columns='_rank').reset_index(drop=True)
     if st.session_state.errors:
         st.warning(f"{len(st.session_state.errors)} market requests failed. Results may be incomplete.")
@@ -256,38 +286,41 @@ def live_dashboard():
             st.write(st.session_state.errors)
     st.caption(f"Last scan: {st.session_state.scanned_at} · {len(scan)} analysed / {st.session_state.universe_count} discovered · {st.session_state.liquid_count} passed liquidity filter")
 
-    review = int((scan.Status == 'REVIEW').sum())
+    confirmed = int((scan.Status == 'CONFIRMED').sum())
+    aggressive = int((scan.Status == 'AGGRESSIVE').sum())
     watch = int((scan.Status == 'WATCH').sum())
     stale = int((scan.Status == 'STALE').sum())
     up = int(scan['15m uptrend'].sum())
-    st.markdown('### 🚦 TRADE RADAR')
-    if review:
-        st.success(f'🟢 {review} SCREENED BUY SETUP(S) — inspect live quotes before considering an order')
-        st.caption('Screening passed, not an instruction to buy. Quotes and order fills can change rapidly.')
+    st.markdown('### 🚦 LIVE TRADE RADAR')
+    if confirmed:
+        st.success(f'🟢 {confirmed} CONFIRMED SCREENING SETUP(S) — verify current quotes and execution costs')
+    elif aggressive:
+        st.warning(f'🟠 {aggressive} EARLY SETUP(S) — higher risk, 15m confirmation incomplete')
     else:
-        st.info('⚪ NO CONFIRMED BUY SETUP — stay in cash and monitor the watchlist.')
+        st.info('⚪ NO BUY SETUP — no action indicated by current screening rules.')
     a, b, c = st.columns(3)
-    a.metric('🟢 Setups', review)
-    b.metric('👀 Watch', watch)
-    c.metric('📈 15m trend', f'{up}/{len(scan)}')
-    st.caption(f'Auto-check every 5 minutes while this page is open · Last completed scan: {st.session_state.scanned_at} · {len(scan)} analysed · {stale} stale')
-    st.progress(min(100, int(100 * up / len(scan))), text=f'Market breadth: {up}/{len(scan)} in 15m uptrends')
-    st.markdown('#### 🎯 TOP OF THE RADAR')
-    for _, candidate in scan.loc[scan.Status.isin(['REVIEW','WATCH'])].head(5).iterrows():
+    a.metric('🟢 Confirmed', confirmed)
+    b.metric('🟠 Early', aggressive)
+    c.metric('👀 Watch', watch)
+    st.caption(f"{len(scan)} analysed · {up}/{len(scan)} in 15m uptrends · {stale} stale · Checked {st.session_state.scanned_at} UTC")
+    st.markdown('#### 🎯 BEST OPPORTUNITIES')
+    shortlist = scan.loc[scan.Status.isin(['CONFIRMED', 'AGGRESSIVE', 'WATCH'])].head(5)
+    if shortlist.empty:
+        st.caption('No qualifying or watchlist candidates. Next scan runs while the page remains active.')
+    for _, candidate in shortlist.iterrows():
         with st.container(border=True):
-            c1,c2=st.columns([3,1])
-            with c1:
-                st.markdown(f"**{candidate['Pair']}** · {int(candidate['Score 5m'])}/100 · {candidate['Net R:R']}:1 net R:R")
-                st.caption(candidate['Why'] if candidate.Status != 'REVIEW' else 'All scanner filters passed; verify live entry, fees and spread')
-            with c2:
-                st.markdown('🟢 **SETUP**' if candidate.Status == 'REVIEW' else '🟡 **WATCH**')
-    if not scan.Status.isin(['REVIEW','WATCH']).any():
-        st.caption('No active watch candidates. The scanner will check again automatically.')
+            st.markdown(f"**{candidate['Pair']}** · **{candidate.Status}** · score {int(candidate['Score 5m'])}/100")
+            st.caption(f"Spread {candidate['Spread %']}% · Net R:R {candidate['Net R:R']}:1 · {candidate['Higher TF']}")
+            st.caption(candidate['Why'])
+            if candidate.Status in ('CONFIRMED', 'AGGRESSIVE'):
+                st.markdown(f"Entry **{candidate.Entry:.8g}** · Stop **{candidate.Stop:.8g}** · Target **{candidate.Target:.8g}**")
+                st.caption(f"Position £{candidate['Position GBP']:.2f} · Planned loss £{candidate['Planned loss GBP']:.2f} · Target gain £{candidate['Target gain GBP']:.2f} (assumptions; excludes slippage/FX)")
+    st.caption('Automatic rescan every 5 minutes while active. Signals are research prompts, not orders.')
 
     tab1, tab2, tab3 = st.tabs(['🏆 RANKINGS', '🔎 CHART LAB', '📥 REPORT'])
     with tab1:
         st.subheader('Opportunity leaderboard')
-        filter_status = st.segmented_control('Show markets', ['All', 'Review', 'Watch', 'Avoid', 'Stale'], default='All')
+        filter_status = st.segmented_control('Show markets', ['All', 'Confirmed', 'Aggressive', 'Watch', 'Avoid', 'Stale'], default='All')
         visible = scan if filter_status == 'All' else scan.loc[scan.Status == filter_status.upper()]
         if visible.empty:
             st.info('No markets in this category on the last scan.')
@@ -299,7 +332,7 @@ def live_dashboard():
                     st.caption(f"5m RSI {r['5m RSI']} · 15m RSI {r['15m RSI']} · RVOL {r['RVOL 5m']}×")
                     st.caption(f"Close {r.Entry:.8g} · Spread {r['Spread %']}% · Net R:R {r['Net R:R']}:1 · 15m {'↑' if r['15m uptrend'] else '↓'}")
                 with right:
-                    st.markdown({'REVIEW':'🟢 **REVIEW**','WATCH':'🟡 **WATCH**','AVOID':'🔴 **AVOID**','STALE':'⚪ **STALE**'}[r.Status])
+                    st.markdown({'CONFIRMED':'🟢 **CONFIRMED**','AGGRESSIVE':'🟠 **EARLY**','WATCH':'🟡 **WATCH**','AVOID':'🔴 **AVOID**','STALE':'⚪ **STALE**'}[r.Status])
         with st.expander('All markets · sortable detailed table'):
             st.dataframe(scan, use_container_width=True, hide_index=True)
 
@@ -353,7 +386,7 @@ def live_dashboard():
         x.metric('Position (£ equivalent)', f"£{r['Position GBP']:.2f}")
         y.metric('Net reward/risk', f"{r['Net R:R']}:1")
         st.caption(f"Estimated loss **£{r['Planned loss GBP']:.2f}** · Estimated target gain **£{r['Target gain GBP']:.2f}** (after assumed trading fees, before FX/slippage)")
-        if r.Status != 'REVIEW':
+        if r.Status not in ('CONFIRMED', 'AGGRESSIVE'):
             st.warning('Not a confirmed setup. ' + str(r.Why))
         st.caption('Levels are based on completed 5m candles, not current executable quotes. GBP-equivalent budget assumes FX conversion without costs; estimates exclude additional slippage, FX fees, taxes and order minimums. Stops may fill worse.')
 
@@ -365,14 +398,14 @@ def live_dashboard():
         report.insert(2, 'Taker fee assumption %', taker)
         report.insert(3, 'Capital GBP', capital)
         report.insert(4, 'Risk budget GBP', max_risk)
-        st.download_button('⬇️ DOWNLOAD V5.2 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
-                           file_name='coinbase_scanner_v5_1_report.csv', mime='text/csv', use_container_width=True)
+        st.download_button('⬇️ DOWNLOAD V6 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
+                           file_name='coinbase_scanner_v6_report.csv', mime='text/csv', use_container_width=True)
         st.caption('Optional deeper analysis: download and share this report. No account keys or personal data are exported.')
         with st.expander('What do the labels mean?'):
-            st.markdown('**REVIEW:** a fresh 5m trigger, 15m confirmation, acceptable spread and estimated net reward/risk. **WATCH:** incomplete confirmation. **AVOID:** bearish conditions. **STALE:** candle data is too old. None of these labels guarantees a trade outcome.')
+            st.markdown('**CONFIRMED:** a fresh 5m trigger plus 15m confirmation and acceptable costs. **AGGRESSIVE:** a volume-backed early 5m trigger without full 15m confirmation; higher risk. **WATCH:** incomplete confirmation. **AVOID:** bearish conditions. **STALE:** candle data is too old. None of these labels guarantees a trade outcome.')
 
     st.divider()
-    st.caption('Auto-check runs only while this browser session is active; Streamlit may sleep when inactive. Research only. Coinbase Exchange public candles and tickers are snapshots and may differ from Coinbase Advanced prices, listings, fees and execution. No leverage, account access or order placement. Never treat a screening signal as a guaranteed trade.')
+    st.caption('Higher timeframes are context, not proof of a trade; 4h bars are aggregated from 1h. Auto-check runs only while this browser session is active; Streamlit may sleep when inactive. Research only. Coinbase Exchange public candles and tickers are snapshots and may differ from Coinbase Advanced prices, listings, fees and execution. No leverage, account access or order placement. Never treat a screening signal as a guaranteed trade.')
 
 
 live_dashboard()
