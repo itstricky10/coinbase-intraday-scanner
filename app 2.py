@@ -36,6 +36,7 @@ def ticker(pair):
     response.raise_for_status()
     return response.json()
 
+
 def indicators(frame):
     d = frame.copy()
     if len(d) < 60:
