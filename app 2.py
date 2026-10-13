@@ -8,11 +8,11 @@ import requests
 import streamlit as st
 
 BASE = 'https://api.exchange.coinbase.com'
-HEADERS = {'User-Agent': 'SpotResearchScanner/5.1', 'Accept': 'application/json'}
-st.set_page_config(page_title='Spot Scanner V5.1 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
+HEADERS = {'User-Agent': 'SpotResearchScanner/5.2', 'Accept': 'application/json'}
+st.set_page_config(page_title='Spot Scanner V5.2 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
 st.markdown('''<style>
 .stApp{background:linear-gradient(160deg,#09131e 0%,#0b1522 55%,#101c2c 100%);color:#eaf2fa}
-.block-container{max-width:1220px;padding-top:1.1rem;padding-bottom:3rem}
+.block-container{max-width:1220px;padding-top:2.2rem;padding-bottom:3rem}
 h1,h2,h3{letter-spacing:-.035em} h1{font-size:2rem!important}
 [data-testid="stMetric"]{background:#132437;border:1px solid #274158;border-radius:15px;padding:12px}
 [data-testid="stMetricLabel"]{color:#a5bfd0}[data-testid="stMetricValue"]{font-size:1.3rem}
@@ -20,7 +20,7 @@ h1,h2,h3{letter-spacing:-.035em} h1{font-size:2rem!important}
 .stButton>button,.stDownloadButton>button{border-radius:12px;min-height:45px;font-weight:650}
 .stTabs [data-baseweb="tab-list"]{gap:4px;overflow-x:auto}.stTabs [data-baseweb="tab"]{border-radius:10px;padding:8px 12px}
 @media(max-width:650px){
-.block-container{padding:2.8rem .7rem 2rem!important}
+.block-container{padding:3.5rem .7rem 2rem!important}
 h1{font-size:1.5rem!important;line-height:1.25!important}h2{font-size:1.22rem!important}
 [data-testid="stMetric"]{padding:7px 9px!important;border-radius:10px!important;min-height:0!important}
 [data-testid="stMetricLabel"]{font-size:.75rem!important}
@@ -29,7 +29,7 @@ h1{font-size:1.5rem!important;line-height:1.25!important}h2{font-size:1.22rem!im
 .stTabs [data-baseweb="tab"]{padding:7px 8px!important;font-size:.85rem!important}
 }
 </style>''', unsafe_allow_html=True)
-st.title('⚡ SPOT SCANNER V5.1')
+st.title('⚡ SPOT SCANNER V5.2')
 st.caption('TRADING DESK  /  COINBASE PUBLIC MARKETS  /  RESEARCH ONLY — NO ORDERS')
 
 
@@ -146,219 +146,233 @@ with st.expander('⚙️ SCANNER SETTINGS · markets, fees and risk'):
         max_risk = st.number_input('Max planned loss (£)', min_value=.1, value=2., step=.5)
     st.caption('USD and GBP turnover are ranked separately; fee values are assumptions. Spread, slippage, FX and tax can change actual results.')
 
-refresh = st.button('🔄  RUN FRESH MARKET SCAN', type='primary', use_container_width=True)
-key = (tuple(sorted(quotes)), scan_limit, min_turnover, max_spread, maker, taker, entry_type, exit_type, capital, max_risk)
-if refresh or 'scan' not in st.session_state or st.session_state.get('key') != key:
-    if not quotes:
-        st.error('Select at least one quote currency.')
-        st.stop()
-    errors, rows = [], []
-    try:
-        with st.spinner('Discovering Coinbase spot markets…'):
-            universe = [p for p in products() if p.rsplit('-', 1)[-1] in quotes]
-    except Exception as exc:
-        st.error(f'Market discovery failed: {exc}')
-        st.stop()
-    activity = []
-    with st.spinner(f'Checking liquidity across {len(universe)} listed pairs…'):
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(stats, p): p for p in universe}
-            for future in as_completed(futures):
-                try:
-                    s = future.result()
-                    if s['Turnover'] >= min_turnover:
-                        activity.append(s)
-                except Exception as exc:
-                    errors.append(f"Activity {futures[future]}: {exc}")
-    if not activity:
-        st.error('No markets passed the liquidity threshold. Lower the threshold or retry.')
-        st.stop()
-    activity_df = pd.DataFrame(activity)
-    chosen = []
-    if len(quotes) == 2:
-        for quote in quotes:
-            chosen.extend(activity_df[activity_df.Pair.str.endswith('-' + quote)].nlargest(scan_limit // 2, 'Turnover').Pair.tolist())
-    for pair in activity_df.nlargest(len(activity_df), 'Turnover').Pair:
-        if len(chosen) >= scan_limit:
-            break
-        if pair not in chosen:
-            chosen.append(pair)
-    er = (maker if entry_type == 'Maker' else taker) / 100
-    xr = (maker if exit_type == 'Maker' else taker) / 100
+refresh = st.button('🔄  SCAN NOW', type='primary', use_container_width=True)
 
-    def inspect(pair):
-        _, fast = analyse(candles(pair, 300), 300)
-        _, slow = analyse(candles(pair, 900), 900)
-        t = ticker(pair)
-        bid, ask = float(t.get('bid') or 0), float(t.get('ask') or 0)
-        spread = 100 * (ask - bid) / ((ask + bid) / 2) if bid > 0 and ask >= bid else np.nan
-        fresh = fast['age'] <= 10 and slow['age'] <= 30
-        aligned = slow['trend'] and slow['momentum'] and 45 <= slow['rsi'] < 75
-        triggered = (fast['breakout'] or fast['sweep']) and fast['trend'] and fast['momentum']
-        risk_pct = (fast['entry'] - fast['stop']) / fast['entry'] + er + xr * fast['stop'] / fast['entry']
-        profit_pct = (fast['target'] - fast['entry']) / fast['entry'] - er - xr * fast['target'] / fast['entry']
-        notional = min(capital / (1 + er), max_risk / risk_pct) if risk_pct > 0 else 0
-        rr = profit_pct / risk_pct if risk_pct > 0 else np.nan
-        eligible = (fresh and aligned and triggered and np.isfinite(spread) and spread <= max_spread
-                    and profit_pct > 0 and rr >= 1.5 and fast['rsi'] < 75)
-        status = ('REVIEW' if eligible else 'STALE' if not fresh else 'AVOID' if fast['bearish'] or slow['bearish']
-                  else 'WATCH')
-        reasons = []
-        if not fresh: reasons.append('Candle data stale')
-        if not triggered: reasons.append('No confirmed 5m trigger')
-        if not aligned: reasons.append('15m trend/momentum not aligned')
-        if not np.isfinite(spread) or spread > max_spread: reasons.append('Spread unavailable/too wide')
-        if not np.isfinite(rr) or rr < 1.5 or profit_pct <= 0: reasons.append('Net reward/risk insufficient')
-        if fast['rsi'] >= 75: reasons.append('5m RSI overextended')
-        if eligible: reasons.append('All screening rules passed; verify live execution')
-        return {'Pair': pair, 'Status': status, 'Score 5m': fast['score'], '5m RSI': round(fast['rsi'], 1),
-                '15m RSI': round(slow['rsi'], 1), 'RVOL 5m': round(fast['rvol'], 2),
-                '5m uptrend': fast['trend'], '15m uptrend': slow['trend'], '15m aligned': aligned,
-                'Breakout': fast['breakout'], 'Sweep': fast['sweep'], 'Spread %': round(spread, 3),
-                'Net R:R': round(rr, 2), 'Entry': fast['entry'], 'Stop': fast['stop'],
-                'Target': fast['target'], 'Position GBP': round(notional, 2),
-                'Planned loss GBP': round(notional * risk_pct, 2),
-                'Target gain GBP': round(notional * profit_pct, 2),
-                '5m age min': round(fast['age'], 1), '15m age min': round(slow['age'], 1),
-                '5m candle UTC': fast['candle'], '15m candle UTC': slow['candle'],
-                'Why': '; '.join(reasons)}
-
-    progress = st.progress(0, text='Running 5m and 15m analysis…')
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(inspect, p): p for p in chosen}
-        for i, future in enumerate(as_completed(futures), 1):
-            try:
-                rows.append(future.result())
-            except Exception as exc:
-                errors.append(f"Analysis {futures[future]}: {exc}")
-            progress.progress(i / len(futures), text=f'Analysed {i}/{len(futures)} pairs')
-    progress.empty()
-    st.session_state.scan = pd.DataFrame(rows)
-    st.session_state.errors = errors
-    st.session_state.key = key
-    st.session_state.scanned_at = datetime.now(timezone.utc).isoformat()
-    st.session_state.universe_count = len(universe)
-    st.session_state.liquid_count = len(activity)
-
-scan = st.session_state.scan
-if scan.empty:
-    st.error('No markets returned. Check request errors or try refreshing.')
-    st.stop()
-rank = {'REVIEW': 0, 'WATCH': 1, 'AVOID': 2, 'STALE': 3}
-scan = scan.assign(_rank=scan.Status.map(rank)).sort_values(['_rank', 'Score 5m', 'RVOL 5m'], ascending=[True, False, False]).drop(columns='_rank').reset_index(drop=True)
-if st.session_state.errors:
-    st.warning(f"{len(st.session_state.errors)} market requests failed. Results may be incomplete.")
-    with st.expander('View request errors'):
-        st.write(st.session_state.errors)
-st.caption(f"Last scan: {st.session_state.scanned_at} · {len(scan)} analysed / {st.session_state.universe_count} discovered · {st.session_state.liquid_count} passed liquidity filter")
-
-review = int((scan.Status == 'REVIEW').sum())
-watch = int((scan.Status == 'WATCH').sum())
-stale = int((scan.Status == 'STALE').sum())
-up = int(scan['15m uptrend'].sum())
-a, b = st.columns(2)
-a.metric('🟢 Review candidates', review)
-b.metric('👀 Watchlist', watch)
-c, d = st.columns(2)
-c.metric('📈 15m uptrends', f'{up}/{len(scan)}')
-d.metric('⏱️ Stale feeds', stale)
-breadth = 100 * up / len(scan) if len(scan) else 0
-st.progress(min(100, int(breadth)), text=f'15m bullish breadth: {breadth:.0f}% of analysed markets')
-st.caption('Breadth covers only scanned liquid pairs; REVIEW is not a buy recommendation.')
-
-tab1, tab2, tab3 = st.tabs(['🏆 RANKINGS', '🔎 CHART LAB', '📥 REPORT'])
-with tab1:
-    st.subheader('Opportunity leaderboard')
-    filter_status = st.segmented_control('Show markets', ['All', 'Review', 'Watch', 'Avoid', 'Stale'], default='All')
-    visible = scan if filter_status == 'All' else scan.loc[scan.Status == filter_status.upper()]
-    if visible.empty:
-        st.info('No markets in this category on the last scan.')
-    for _, r in visible.head(15).iterrows():
-        with st.container(border=True):
-            left, right = st.columns([3, 1])
-            with left:
-                st.markdown(f"**{r['Pair']}**  ·  {int(r['Score 5m'])}/100")
-                st.caption(f"5m RSI {r['5m RSI']} · 15m RSI {r['15m RSI']} · RVOL {r['RVOL 5m']}×")
-                st.caption(f"Close {r.Entry:.8g} · Spread {r['Spread %']}% · Net R:R {r['Net R:R']}:1 · 15m {'↑' if r['15m uptrend'] else '↓'}")
-            with right:
-                st.markdown({'REVIEW':'🟢 **REVIEW**','WATCH':'🟡 **WATCH**','AVOID':'🔴 **AVOID**','STALE':'⚪ **STALE**'}[r.Status])
-    with st.expander('All markets · sortable detailed table'):
-        st.dataframe(scan, use_container_width=True, hide_index=True)
-
-with tab2:
-    st.subheader('Chart lab')
-    pair = st.selectbox('Choose a market', scan.Pair.tolist())
-    r = scan.loc[scan.Pair == pair].iloc[0]
-    chart_window = st.segmented_control('Chart window', ['6h', '12h', '24h', 'All'], default='12h', key='chart_window')
-    overlays = st.toggle('Show indicative entry, stop and target', value=True)
-    st.caption(f"Signal: {r.Status} · 5m score: {r['Score 5m']}/100 · 15m RSI: {r['15m RSI']}")
-    with st.container(border=True):
-        st.markdown(f"### {pair}  ·  {r.Status}")
-        st.write('**Why it passed or failed:** ' + r.Why)
-        st.caption(f"Last completed candles: 5m {r['5m candle UTC']} · 15m {r['15m candle UTC']}")
-    for tf, secs in [('5-minute chart', 300), ('15-minute confirmation', 900)]:
+@st.fragment(run_every='5min')
+def live_dashboard():
+    key = (tuple(sorted(quotes)), scan_limit, min_turnover, max_spread, maker, taker, entry_type, exit_type, capital, max_risk)
+    if refresh or 'scan' not in st.session_state or st.session_state.get('key') != key or time.time() - st.session_state.get('scan_epoch', 0) >= 300:
+        if not quotes:
+            st.error('Select at least one quote currency.')
+            st.stop()
+        errors, rows = [], []
         try:
-            d, _ = analyse(candles(pair, secs), secs)
-            st.markdown(f'**{tf}**')
-            if chart_window != 'All':
-                hours = {'6h': 6, '12h': 12, '24h': 24}[chart_window]
-                cutoff = d.utc.max() - pd.Timedelta(hours=hours)
-                d = d.loc[d.utc >= cutoff].copy()
-            if len(d) < 2:
-                st.info('Not enough candles in the selected chart window.')
-                continue
-            # Plotly is bundled with Streamlit's standard installation, but listed explicitly in requirements for portability.
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[.77, .23], vertical_spacing=.035)
-            fig.add_trace(go.Candlestick(x=d.utc, open=d.open, high=d.high, low=d.low, close=d.close,
-                                         name='Candles', increasing_line_color='#19c5aa', decreasing_line_color='#ff6481'), row=1, col=1)
-            for name, color in [('EMA20', '#4ba8ff'), ('EMA50', '#ffc66d'), ('VWAP', '#c98fff')]:
-                fig.add_trace(go.Scatter(x=d.utc, y=d[name], mode='lines', name=name, line=dict(color=color, width=1.5)), row=1, col=1)
-            fig.add_trace(go.Bar(x=d.utc, y=d.volume, name='Volume', marker_color='#436d85'), row=2, col=1)
-            # Levels are derived from the 5m setup; on 15m they remain reference levels only.
-            if overlays and np.isfinite([r.Entry, r.Stop, r.Target]).all():
-                for label, level, color in [('Entry', r.Entry, '#54c5ff'), ('Stop', r.Stop, '#ff6481'), ('Target', r.Target, '#3be0ac')]:
-                    fig.add_hline(y=float(level), line_color=color, line_dash='dot', line_width=1,
-                                  annotation_text=label, annotation_position='top left', row=1, col=1)
-            if len(d) >= 12:
-                resistance = float(d.high.iloc[-12:-1].max())
-                support = float(d.low.iloc[-12:-1].min())
-                fig.add_hline(y=resistance, line_color='#f5bc6d', line_dash='dash', line_width=1,
-                              annotation_text='Recent resistance', annotation_position='bottom left', row=1, col=1)
-                fig.add_hline(y=support, line_color='#9fb2c6', line_dash='dash', line_width=1,
-                              annotation_text='Recent support', annotation_position='bottom left', row=1, col=1)
-            fig.update_layout(height=390, margin=dict(l=4, r=4, t=15, b=5), paper_bgcolor='#101d2b',
-                              plot_bgcolor='#101d2b', font=dict(color='#dce8f2'),
-                              legend=dict(orientation='h', y=1.04, x=0), xaxis_rangeslider_visible=False)
-            fig.update_xaxes(showgrid=False)
-            fig.update_yaxes(gridcolor='#203447')
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            with st.spinner('Discovering Coinbase spot markets…'):
+                universe = [p for p in products() if p.rsplit('-', 1)[-1] in quotes]
         except Exception as exc:
-            st.warning(f'Chart unavailable: {exc}')
-    st.subheader('Indicative trade plan · long only')
-    st.markdown(f"**Entry:** `{r.Entry:.8g}`　 **Stop:** `{r.Stop:.8g}`　 **Target:** `{r.Target:.8g}`")
-    x, y = st.columns(2)
-    x.metric('Position (£ equivalent)', f"£{r['Position GBP']:.2f}")
-    y.metric('Net reward/risk', f"{r['Net R:R']}:1")
-    st.caption(f"Estimated loss **£{r['Planned loss GBP']:.2f}** · Estimated target gain **£{r['Target gain GBP']:.2f}** (after assumed trading fees, before FX/slippage)")
-    if r.Status != 'REVIEW':
-        st.warning('Not a confirmed setup. ' + str(r.Why))
-    st.caption('Levels are based on completed 5m candles, not current executable quotes. GBP-equivalent budget assumes FX conversion without costs; estimates exclude additional slippage, FX fees, taxes and order minimums. Stops may fill worse.')
+            st.error(f'Market discovery failed: {exc}')
+            st.stop()
+        activity = []
+        with st.spinner(f'Checking liquidity across {len(universe)} listed pairs…'):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(stats, p): p for p in universe}
+                for future in as_completed(futures):
+                    try:
+                        s = future.result()
+                        if s['Turnover'] >= min_turnover:
+                            activity.append(s)
+                    except Exception as exc:
+                        errors.append(f"Activity {futures[future]}: {exc}")
+        if not activity:
+            st.error('No markets passed the liquidity threshold. Lower the threshold or retry.')
+            st.stop()
+        activity_df = pd.DataFrame(activity)
+        chosen = []
+        if len(quotes) == 2:
+            for quote in quotes:
+                chosen.extend(activity_df[activity_df.Pair.str.endswith('-' + quote)].nlargest(scan_limit // 2, 'Turnover').Pair.tolist())
+        for pair in activity_df.nlargest(len(activity_df), 'Turnover').Pair:
+            if len(chosen) >= scan_limit:
+                break
+            if pair not in chosen:
+                chosen.append(pair)
+        er = (maker if entry_type == 'Maker' else taker) / 100
+        xr = (maker if exit_type == 'Maker' else taker) / 100
 
-with tab3:
-    st.subheader('Share this scan with ChatGPT')
-    report = scan.copy()
-    report.insert(0, 'Scan fetched UTC', st.session_state.scanned_at)
-    report.insert(1, 'Maker fee assumption %', maker)
-    report.insert(2, 'Taker fee assumption %', taker)
-    report.insert(3, 'Capital GBP', capital)
-    report.insert(4, 'Risk budget GBP', max_risk)
-    st.download_button('⬇️ DOWNLOAD V5.1 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
-                       file_name='coinbase_scanner_v5_1_report.csv', mime='text/csv', use_container_width=True)
-    st.caption('Download the CSV and attach it in our conversation. No account keys or personal data are exported.')
-    with st.expander('What do the labels mean?'):
-        st.markdown('**REVIEW:** a fresh 5m trigger, 15m confirmation, acceptable spread and estimated net reward/risk. **WATCH:** incomplete confirmation. **AVOID:** bearish conditions. **STALE:** candle data is too old. None of these labels guarantees a trade outcome.')
+        def inspect(pair):
+            _, fast = analyse(candles(pair, 300), 300)
+            _, slow = analyse(candles(pair, 900), 900)
+            t = ticker(pair)
+            bid, ask = float(t.get('bid') or 0), float(t.get('ask') or 0)
+            spread = 100 * (ask - bid) / ((ask + bid) / 2) if bid > 0 and ask >= bid else np.nan
+            fresh = fast['age'] <= 10 and slow['age'] <= 30
+            aligned = slow['trend'] and slow['momentum'] and 45 <= slow['rsi'] < 75
+            triggered = (fast['breakout'] or fast['sweep']) and fast['trend'] and fast['momentum']
+            risk_pct = (fast['entry'] - fast['stop']) / fast['entry'] + er + xr * fast['stop'] / fast['entry']
+            profit_pct = (fast['target'] - fast['entry']) / fast['entry'] - er - xr * fast['target'] / fast['entry']
+            notional = min(capital / (1 + er), max_risk / risk_pct) if risk_pct > 0 else 0
+            rr = profit_pct / risk_pct if risk_pct > 0 else np.nan
+            eligible = (fresh and aligned and triggered and np.isfinite(spread) and spread <= max_spread
+                        and profit_pct > 0 and rr >= 1.5 and fast['rsi'] < 75)
+            status = ('REVIEW' if eligible else 'STALE' if not fresh else 'AVOID' if fast['bearish'] or slow['bearish']
+                      else 'WATCH')
+            reasons = []
+            if not fresh: reasons.append('Candle data stale')
+            if not triggered: reasons.append('No confirmed 5m trigger')
+            if not aligned: reasons.append('15m trend/momentum not aligned')
+            if not np.isfinite(spread) or spread > max_spread: reasons.append('Spread unavailable/too wide')
+            if not np.isfinite(rr) or rr < 1.5 or profit_pct <= 0: reasons.append('Net reward/risk insufficient')
+            if fast['rsi'] >= 75: reasons.append('5m RSI overextended')
+            if eligible: reasons.append('All screening rules passed; verify live execution')
+            return {'Pair': pair, 'Status': status, 'Score 5m': fast['score'], '5m RSI': round(fast['rsi'], 1),
+                    '15m RSI': round(slow['rsi'], 1), 'RVOL 5m': round(fast['rvol'], 2),
+                    '5m uptrend': fast['trend'], '15m uptrend': slow['trend'], '15m aligned': aligned,
+                    'Breakout': fast['breakout'], 'Sweep': fast['sweep'], 'Spread %': round(spread, 3),
+                    'Net R:R': round(rr, 2), 'Entry': fast['entry'], 'Stop': fast['stop'],
+                    'Target': fast['target'], 'Position GBP': round(notional, 2),
+                    'Planned loss GBP': round(notional * risk_pct, 2),
+                    'Target gain GBP': round(notional * profit_pct, 2),
+                    '5m age min': round(fast['age'], 1), '15m age min': round(slow['age'], 1),
+                    '5m candle UTC': fast['candle'], '15m candle UTC': slow['candle'],
+                    'Why': '; '.join(reasons)}
 
-st.divider()
-st.caption('Research only. Coinbase Exchange public candles and tickers are snapshots and may differ from Coinbase Advanced prices, listings, fees and execution. No leverage, account access or order placement. Never treat a screening signal as a guaranteed trade.')
+        progress = st.progress(0, text='Running 5m and 15m analysis…')
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(inspect, p): p for p in chosen}
+            for i, future in enumerate(as_completed(futures), 1):
+                try:
+                    rows.append(future.result())
+                except Exception as exc:
+                    errors.append(f"Analysis {futures[future]}: {exc}")
+                progress.progress(i / len(futures), text=f'Analysed {i}/{len(futures)} pairs')
+        progress.empty()
+        st.session_state.scan = pd.DataFrame(rows)
+        st.session_state.errors = errors
+        st.session_state.key = key
+        st.session_state.scanned_at = datetime.now(timezone.utc).isoformat()
+        st.session_state.scan_epoch = time.time()
+        st.session_state.universe_count = len(universe)
+        st.session_state.liquid_count = len(activity)
+
+    scan = st.session_state.scan
+    if scan.empty:
+        st.error('No markets returned. Check request errors or try refreshing.')
+        st.stop()
+    rank = {'REVIEW': 0, 'WATCH': 1, 'AVOID': 2, 'STALE': 3}
+    scan = scan.assign(_rank=scan.Status.map(rank)).sort_values(['_rank', 'Score 5m', 'RVOL 5m'], ascending=[True, False, False]).drop(columns='_rank').reset_index(drop=True)
+    if st.session_state.errors:
+        st.warning(f"{len(st.session_state.errors)} market requests failed. Results may be incomplete.")
+        with st.expander('View request errors'):
+            st.write(st.session_state.errors)
+    st.caption(f"Last scan: {st.session_state.scanned_at} · {len(scan)} analysed / {st.session_state.universe_count} discovered · {st.session_state.liquid_count} passed liquidity filter")
+
+    review = int((scan.Status == 'REVIEW').sum())
+    watch = int((scan.Status == 'WATCH').sum())
+    stale = int((scan.Status == 'STALE').sum())
+    up = int(scan['15m uptrend'].sum())
+    st.markdown('### 🚦 TRADE RADAR')
+    if review:
+        st.success(f'🟢 {review} SCREENED BUY SETUP(S) — inspect live quotes before considering an order')
+        st.caption('Screening passed, not an instruction to buy. Quotes and order fills can change rapidly.')
+    else:
+        st.info('⚪ NO CONFIRMED BUY SETUP — stay in cash and monitor the watchlist.')
+    a, b, c = st.columns(3)
+    a.metric('🟢 Setups', review)
+    b.metric('👀 Watch', watch)
+    c.metric('📈 15m trend', f'{up}/{len(scan)}')
+    st.caption(f'Auto-check every 5 minutes while this page is open · Last completed scan: {st.session_state.scanned_at} · {len(scan)} analysed · {stale} stale')
+    st.progress(min(100, int(100 * up / len(scan))), text=f'Market breadth: {up}/{len(scan)} in 15m uptrends')
+    st.markdown('#### 🎯 TOP OF THE RADAR')
+    for _, candidate in scan.loc[scan.Status.isin(['REVIEW','WATCH'])].head(5).iterrows():
+        with st.container(border=True):
+            c1,c2=st.columns([3,1])
+            with c1:
+                st.markdown(f"**{candidate['Pair']}** · {int(candidate['Score 5m'])}/100 · {candidate['Net R:R']}:1 net R:R")
+                st.caption(candidate['Why'] if candidate.Status != 'REVIEW' else 'All scanner filters passed; verify live entry, fees and spread')
+            with c2:
+                st.markdown('🟢 **SETUP**' if candidate.Status == 'REVIEW' else '🟡 **WATCH**')
+    if not scan.Status.isin(['REVIEW','WATCH']).any():
+        st.caption('No active watch candidates. The scanner will check again automatically.')
+
+    tab1, tab2, tab3 = st.tabs(['🏆 RANKINGS', '🔎 CHART LAB', '📥 REPORT'])
+    with tab1:
+        st.subheader('Opportunity leaderboard')
+        filter_status = st.segmented_control('Show markets', ['All', 'Review', 'Watch', 'Avoid', 'Stale'], default='All')
+        visible = scan if filter_status == 'All' else scan.loc[scan.Status == filter_status.upper()]
+        if visible.empty:
+            st.info('No markets in this category on the last scan.')
+        for _, r in visible.head(15).iterrows():
+            with st.container(border=True):
+                left, right = st.columns([3, 1])
+                with left:
+                    st.markdown(f"**{r['Pair']}**  ·  {int(r['Score 5m'])}/100")
+                    st.caption(f"5m RSI {r['5m RSI']} · 15m RSI {r['15m RSI']} · RVOL {r['RVOL 5m']}×")
+                    st.caption(f"Close {r.Entry:.8g} · Spread {r['Spread %']}% · Net R:R {r['Net R:R']}:1 · 15m {'↑' if r['15m uptrend'] else '↓'}")
+                with right:
+                    st.markdown({'REVIEW':'🟢 **REVIEW**','WATCH':'🟡 **WATCH**','AVOID':'🔴 **AVOID**','STALE':'⚪ **STALE**'}[r.Status])
+        with st.expander('All markets · sortable detailed table'):
+            st.dataframe(scan, use_container_width=True, hide_index=True)
+
+    with tab2:
+        st.subheader('Chart lab')
+        pair = st.selectbox('Choose a market', scan.Pair.tolist())
+        r = scan.loc[scan.Pair == pair].iloc[0]
+        chart_window = st.segmented_control('Chart window', ['6h', '12h', '24h', 'All'], default='6h', key='chart_window')
+        overlays = st.toggle('Show entry / stop / target lines', value=False)
+        st.caption(f"Signal: {r.Status} · 5m score: {r['Score 5m']}/100 · 15m RSI: {r['15m RSI']}")
+        with st.container(border=True):
+            st.markdown(f"### {pair}  ·  {r.Status}")
+            st.write('**Why it passed or failed:** ' + r.Why)
+            st.caption(f"Last completed candles: 5m {r['5m candle UTC']} · 15m {r['15m candle UTC']}")
+        for tf, secs in [('5-minute chart', 300), ('15-minute confirmation', 900)]:
+            try:
+                d, _ = analyse(candles(pair, secs), secs)
+                st.markdown(f'**{tf}**')
+                if chart_window != 'All':
+                    hours = {'6h': 6, '12h': 12, '24h': 24}[chart_window]
+                    cutoff = d.utc.max() - pd.Timedelta(hours=hours)
+                    d = d.loc[d.utc >= cutoff].copy()
+                if len(d) < 2:
+                    st.info('Not enough candles in the selected chart window.')
+                    continue
+                # Plotly is bundled with Streamlit's standard installation, but listed explicitly in requirements for portability.
+                import plotly.graph_objects as go
+                from plotly.subplots import make_subplots
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[.77, .23], vertical_spacing=.035)
+                fig.add_trace(go.Candlestick(x=d.utc, open=d.open, high=d.high, low=d.low, close=d.close,
+                                             name='Candles', increasing_line_color='#19c5aa', decreasing_line_color='#ff6481'), row=1, col=1)
+                for name, color in [('EMA20', '#4ba8ff'), ('EMA50', '#ffc66d')]:
+                    fig.add_trace(go.Scatter(x=d.utc, y=d[name], mode='lines', name=name, line=dict(color=color, width=1.5)), row=1, col=1)
+                fig.add_trace(go.Bar(x=d.utc, y=d.volume, name='Volume', marker_color='#436d85'), row=2, col=1)
+                # Levels are derived from the 5m setup; on 15m they remain reference levels only.
+                if overlays and np.isfinite([r.Entry, r.Stop, r.Target]).all():
+                    for label, level, color in [('Entry', r.Entry, '#54c5ff'), ('Stop', r.Stop, '#ff6481'), ('Target', r.Target, '#3be0ac')]:
+                        fig.add_hline(y=float(level), line_color=color, line_dash='dot', line_width=1,
+                                      annotation_text=label, annotation_position='top left', row=1, col=1)
+                fig.update_layout(height=340, margin=dict(l=4, r=4, t=15, b=5), paper_bgcolor='#101d2b',
+                                  plot_bgcolor='#101d2b', font=dict(color='#dce8f2'),
+                                  legend=dict(orientation='h', y=1.08, x=0, font=dict(size=10)), xaxis_rangeslider_visible=False)
+                fig.update_xaxes(showgrid=False)
+                fig.update_yaxes(gridcolor='#203447')
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
+            except Exception as exc:
+                st.warning(f'Chart unavailable: {exc}')
+        st.subheader('Indicative trade plan · long only')
+        st.markdown(f"**Entry:** `{r.Entry:.8g}`　 **Stop:** `{r.Stop:.8g}`　 **Target:** `{r.Target:.8g}`")
+        x, y = st.columns(2)
+        x.metric('Position (£ equivalent)', f"£{r['Position GBP']:.2f}")
+        y.metric('Net reward/risk', f"{r['Net R:R']}:1")
+        st.caption(f"Estimated loss **£{r['Planned loss GBP']:.2f}** · Estimated target gain **£{r['Target gain GBP']:.2f}** (after assumed trading fees, before FX/slippage)")
+        if r.Status != 'REVIEW':
+            st.warning('Not a confirmed setup. ' + str(r.Why))
+        st.caption('Levels are based on completed 5m candles, not current executable quotes. GBP-equivalent budget assumes FX conversion without costs; estimates exclude additional slippage, FX fees, taxes and order minimums. Stops may fill worse.')
+
+    with tab3:
+        st.subheader('Optional detailed report')
+        report = scan.copy()
+        report.insert(0, 'Scan fetched UTC', st.session_state.scanned_at)
+        report.insert(1, 'Maker fee assumption %', maker)
+        report.insert(2, 'Taker fee assumption %', taker)
+        report.insert(3, 'Capital GBP', capital)
+        report.insert(4, 'Risk budget GBP', max_risk)
+        st.download_button('⬇️ DOWNLOAD V5.2 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
+                           file_name='coinbase_scanner_v5_1_report.csv', mime='text/csv', use_container_width=True)
+        st.caption('Optional deeper analysis: download and share this report. No account keys or personal data are exported.')
+        with st.expander('What do the labels mean?'):
+            st.markdown('**REVIEW:** a fresh 5m trigger, 15m confirmation, acceptable spread and estimated net reward/risk. **WATCH:** incomplete confirmation. **AVOID:** bearish conditions. **STALE:** candle data is too old. None of these labels guarantees a trade outcome.')
+
+    st.divider()
+    st.caption('Auto-check runs only while this browser session is active; Streamlit may sleep when inactive. Research only. Coinbase Exchange public candles and tickers are snapshots and may differ from Coinbase Advanced prices, listings, fees and execution. No leverage, account access or order placement. Never treat a screening signal as a guaranteed trade.')
+
+
+live_dashboard()
