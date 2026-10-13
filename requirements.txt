@@ -2,3 +2,4 @@ streamlit>=1.36,<2
 pandas>=2.0,<3
 numpy>=1.26,<3
 requests>=2.31,<3
+plotly>=5.20,<7
