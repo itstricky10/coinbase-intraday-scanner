@@ -1,4 +1,4 @@
-"""Coinbase Spot Scanner V6.2. Public-data research tool; does not execute trades."""
+"""Coinbase Spot Scanner V6.3. Public-data research tool; does not execute trades."""
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import time
@@ -8,8 +8,8 @@ import requests
 import streamlit as st
 
 BASE = 'https://api.exchange.coinbase.com'
-HEADERS = {'User-Agent': 'SpotResearchScanner/6.2', 'Accept': 'application/json'}
-st.set_page_config(page_title='Spot Scanner V6.2 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
+HEADERS = {'User-Agent': 'SpotResearchScanner/6.3', 'Accept': 'application/json'}
+st.set_page_config(page_title='Spot Scanner V6.3 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
 st.markdown('''<style>
 .stApp{background:linear-gradient(160deg,#09131e 0%,#0b1522 55%,#101c2c 100%);color:#eaf2fa}
 .block-container{max-width:1220px;padding-top:2.2rem;padding-bottom:3rem}
@@ -31,7 +31,7 @@ h1{font-size:1.5rem!important;line-height:1.25!important}
 .stTabs [data-baseweb="tab"]{padding:7px 8px!important;font-size:.85rem!important}
 }
 </style>''', unsafe_allow_html=True)
-st.title('⚡ TRADING DESK V6.2')
+st.title('⚡ TRADING DESK V6.3')
 st.caption('COINBASE SPOT · EARLY + CONFIRMED SETUPS · RESEARCH ONLY')
 
 
@@ -147,14 +147,84 @@ with st.expander('⚙️ SCANNER SETTINGS · markets, fees and risk'):
         exit_type = st.selectbox('Exit fee', ['Taker', 'Maker'])
         capital = st.number_input('Account capital (£)', min_value=1., value=100., step=10.)
         max_risk = st.number_input('Max planned loss (£)', min_value=.1, value=2., step=.5)
-    st.caption('£100 → £1,000 is an aspirational 10× target, not a forecast. No deadline; no forced trades. Fees are assumptions; FX, spread, slippage and tax may change outcomes.')
+    st.caption('Capital growth research · no return target or deadline. Fees are assumptions; FX, spread, slippage and tax may change outcomes.')
 
-# Observation journal: no server-side durable storage or brokerage access.
+# Observation journal: optional private Supabase persistence; otherwise session-only.
 JOURNAL_COLUMNS = ['ID', 'Observed UTC', 'Pair', 'Strategy', 'Signal candle UTC',
                    'Entry', 'Stop', 'Target', 'Size GBP', 'Entry fee rate', 'Exit fee rate',
                    'Outcome', 'Outcome UTC', 'Net GBP', 'R multiple']
 if 'journal' not in st.session_state:
     st.session_state.journal = pd.DataFrame(columns=JOURNAL_COLUMNS)
+
+# Optional durable store. Configure private Streamlit Secrets (never in GitHub).
+# Service-role key is server-side only; do not expose it in widgets or client code.
+def db_config():
+    try:
+        url = str(st.secrets.get('SUPABASE_URL', '')).rstrip('/')
+        key = str(st.secrets.get('SUPABASE_SERVICE_ROLE_KEY', ''))
+        return (url, key) if url.startswith('https://') and key else None
+    except Exception:
+        return None
+
+
+def db_request(method, path, payload=None, params=None):
+    config = db_config()
+    if not config:
+        raise RuntimeError('Persistent database not configured')
+    url, key = config
+    headers = {'apikey': key, 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'}
+    if method == 'POST':
+        headers['Prefer'] = 'resolution=merge-duplicates,return=minimal'
+    response = requests.request(method, url + '/rest/v1/' + path,
+                                headers=headers, json=payload, params=params, timeout=20)
+    response.raise_for_status()
+    return response.json() if response.content else None
+
+
+def journal_records(frame):
+    # JSON-safe records, preserving ID as unique key and empty values as null.
+    records = frame[JOURNAL_COLUMNS].replace({np.nan: None}).to_dict('records')
+    result = []
+    for rec in records:
+        cleaned = {}
+        for k, v in rec.items():
+            if pd.isna(v) if not isinstance(v, (list, dict)) else False:
+                v = None
+            if isinstance(v, np.generic):
+                v = v.item()
+            cleaned[k] = v
+        result.append({'id': str(cleaned['ID']), 'payload': cleaned})
+    return result
+
+
+def save_journal():
+    if not db_config():
+        return
+    records = journal_records(st.session_state.journal)
+    for offset in range(0, len(records), 100):
+        db_request('POST', 'scanner_signal_journal?on_conflict=id', records[offset:offset + 100])
+
+
+def load_journal():
+    if not db_config():
+        return
+    # Pull newest first. This cap is explicit, not a silent full-history guarantee.
+    data = db_request('GET', 'scanner_signal_journal',
+                      params={'select': 'payload', 'order': 'created_at.desc', 'limit': 10000}) or []
+    if data:
+        incoming = pd.DataFrame([item['payload'] for item in data])
+        if set(JOURNAL_COLUMNS).issubset(incoming.columns):
+            st.session_state.journal = incoming[JOURNAL_COLUMNS].drop_duplicates('ID', keep='first')
+
+
+if 'journal_loaded_v63' not in st.session_state:
+    st.session_state.journal_loaded_v63 = True
+    if db_config():
+        try:
+            load_journal()
+        except Exception as exc:
+            st.session_state.db_error = f'Database load failed: {exc}'
+
 
 
 def append_signals(scan, stamp, er, xr):
@@ -218,9 +288,13 @@ with st.expander('📒 Restore a previously downloaded signal journal'):
         try:
             incoming = pd.read_csv(restored)
             if not set(JOURNAL_COLUMNS).issubset(incoming.columns):
-                raise ValueError('Not a V6.2 signal journal backup')
+                raise ValueError('Not a V6.3 signal journal backup')
             incoming = incoming[JOURNAL_COLUMNS].drop_duplicates('ID', keep='last')
             st.session_state.journal = incoming
+            try:
+                save_journal()
+            except Exception as exc:
+                st.error(f'Database save failed: {exc}')
             st.success(f'Restored {len(incoming)} observations. Scan to update outcomes.')
         except Exception as exc:
             st.error(f'Unable to restore: {exc}')
@@ -400,6 +474,12 @@ def live_dashboard():
         fee_out = (maker if exit_type == 'Maker' else taker) / 100
         append_signals(scan, st.session_state.scanned_at, fee_in, fee_out)
         update_outcomes()
+        if db_config():
+            try:
+                save_journal()
+                st.session_state.db_error = None
+            except Exception as exc:
+                st.session_state.db_error = f'Database save failed: {exc}'
     rank = {'CONFIRMED': 0, 'AGGRESSIVE': 1, 'WATCH': 2, 'AVOID': 3, 'STALE': 4}
     scan = scan.assign(_rank=scan.Status.map(rank)).sort_values(['_rank', 'Score 5m', 'RVOL 5m'], ascending=[True, False, False]).drop(columns='_rank').reset_index(drop=True)
     if st.session_state.errors:
@@ -416,7 +496,7 @@ def live_dashboard():
     swing_setups = int((scan['Swing signal'] == 'SWING SETUP').sum())
     swing_watch = int((scan['Swing signal'] == 'SWING WATCH').sum())
     st.markdown('### 🚦 GROWTH OPPORTUNITY RADAR')
-    st.caption('Goal: £100 → £1,000 (10× stretch) · No deadline · Risk budget per idea: £' + f'{max_risk:.2f}')
+    st.caption('Objective: disciplined long-term capital growth · No forced trades · Planned risk budget per idea: £' + f'{max_risk:.2f}')
     if confirmed:
         st.success(f'🟢 {confirmed} CONFIRMED SCREENING SETUP(S) — verify current quotes and execution costs')
     elif aggressive:
@@ -537,14 +617,17 @@ def live_dashboard():
         report.insert(2, 'Taker fee assumption %', taker)
         report.insert(3, 'Capital GBP', capital)
         report.insert(4, 'Risk budget GBP', max_risk)
-        st.download_button('⬇️ DOWNLOAD V6.2 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
-                           file_name='coinbase_scanner_v6_1_report.csv', mime='text/csv', use_container_width=True)
+        st.download_button('⬇️ DOWNLOAD V6.3 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
+                           file_name='coinbase_scanner_v6_3_report.csv', mime='text/csv', use_container_width=True)
         st.caption('Optional deeper analysis: download and share this report. No account keys or personal data are exported.')
         with st.expander('What do the labels mean?'):
             st.markdown('**CONFIRMED:** a fresh 5m trigger plus 15m confirmation and acceptable costs. **AGGRESSIVE:** a volume-backed early 5m trigger without full 15m confirmation; higher risk. **WATCH:** incomplete confirmation. **AVOID:** bearish conditions. **STALE:** candle data is too old. None of these labels guarantees a trade outcome.')
 
     with tab4:
         st.subheader('Signal outcome journal · paper observations')
+        st.caption('Storage: ' + ('Private Supabase database (configured)' if db_config() else 'SESSION ONLY — database setup required'))
+        if st.session_state.get('db_error'):
+            st.error(st.session_state.db_error)
         journal = st.session_state.journal
         resolved = journal.loc[journal['Outcome'].isin(['TARGET', 'STOP'])].copy()
         st.caption('Tracks qualifying scanner signals, NOT executed trades. No capital is invested by this journal.')
@@ -557,11 +640,11 @@ def live_dashboard():
             st.info('No resolved signal outcomes yet. Only qualifying signals are logged; watchlist candidates are not counted as trades.')
         st.dataframe(journal.tail(100).iloc[::-1], use_container_width=True, hide_index=True)
         st.download_button('⬇️ BACK UP SIGNAL JOURNAL CSV', journal.to_csv(index=False).encode(),
-                           file_name='scanner_v6_2_signal_journal.csv', mime='text/csv', use_container_width=True)
-        st.caption('Journal is stored only in this Streamlit session. Download the CSV regularly: app sleep, restarts or a new session can erase it. Outcomes are checked only when the scanner runs; old candles may expire from the Coinbase API. No guaranteed alerts.')
+                           file_name='scanner_v6_3_signal_journal.csv', mime='text/csv', use_container_width=True)
+        st.caption('When Supabase is configured, qualifying signals and outcomes are saved to a private database. Otherwise storage is session-only: back up CSV regularly. Outcomes are checked only while the app scans; historical Coinbase candles may expire. No guaranteed alerts.')
 
     st.divider()
-    st.caption('Swing signals are technical research prompts, not independently verified positive-expectancy strategies. Signal journal is session-only and must be exported; it is not a backtest or a durable database. Higher timeframes are context, not proof of a trade; 4h bars are aggregated from 1h. Auto-check runs only while this browser session is active; Streamlit may sleep when inactive. Research only. Coinbase Exchange public candles and tickers are snapshots and may differ from Coinbase Advanced prices, listings, fees and execution. No leverage, account access or order placement. Never treat a screening signal as a guaranteed trade.')
+    st.caption('Swing signals are technical research prompts, not independently verified positive-expectancy strategies. Signal journal uses durable storage only if a private database is configured; it is not a backtest. Higher timeframes are context, not proof of a trade; 4h bars are aggregated from 1h. Auto-check runs only while this browser session is active; Streamlit may sleep when inactive. Research only. Coinbase Exchange public candles and tickers are snapshots and may differ from Coinbase Advanced prices, listings, fees and execution. No leverage, account access or order placement. Never treat a screening signal as a guaranteed trade.')
 
 
 live_dashboard()
