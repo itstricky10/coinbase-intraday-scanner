@@ -1,4 +1,4 @@
-"""Coinbase Spot Scanner V6. Public-data research tool; does not execute trades."""
+"""Coinbase Spot Scanner V6.1. Public-data research tool; does not execute trades."""
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import time
@@ -8,8 +8,8 @@ import requests
 import streamlit as st
 
 BASE = 'https://api.exchange.coinbase.com'
-HEADERS = {'User-Agent': 'SpotResearchScanner/6.0', 'Accept': 'application/json'}
-st.set_page_config(page_title='Spot Scanner V6 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
+HEADERS = {'User-Agent': 'SpotResearchScanner/6.1', 'Accept': 'application/json'}
+st.set_page_config(page_title='Spot Scanner V6.1 | Trading Desk', page_icon='⚡', layout='wide', initial_sidebar_state='collapsed')
 st.markdown('''<style>
 .stApp{background:linear-gradient(160deg,#09131e 0%,#0b1522 55%,#101c2c 100%);color:#eaf2fa}
 .block-container{max-width:1220px;padding-top:2.2rem;padding-bottom:3rem}
@@ -137,7 +137,7 @@ with st.expander('⚙️ SCANNER SETTINGS · markets, fees and risk'):
         scan_limit = st.slider('Markets to scan', 10, 100, 50, step=10)
         min_turnover = st.number_input('Minimum 24h turnover (quote currency)', min_value=0., value=100000., step=50000.)
         max_spread = st.number_input('Maximum spread (%)', min_value=0., max_value=10., value=.5, step=.05)
-        use_higher = st.toggle('Include 1h / 4h / daily context', value=True, help='Extra API requests; scans take longer.')
+        use_higher = st.toggle('Include independent swing radar (1h / 4h / daily)', value=True, help='Extra API requests; scans take longer.')
     with q2:
         maker = st.number_input('Maker fee per side (%) — verify account', 0., 5., .25, .05)
         taker = st.number_input('Taker fee per side (%) — verify account', 0., 5., .50, .05)
@@ -145,7 +145,7 @@ with st.expander('⚙️ SCANNER SETTINGS · markets, fees and risk'):
         exit_type = st.selectbox('Exit fee', ['Taker', 'Maker'])
         capital = st.number_input('Account capital (£)', min_value=1., value=100., step=10.)
         max_risk = st.number_input('Max planned loss (£)', min_value=.1, value=2., step=.5)
-    st.caption('USD and GBP turnover are ranked separately; fee values are assumptions. Spread, slippage, FX and tax can change actual results.')
+    st.caption('£100 → £1,000 is an aspirational 10× target, not a forecast. No deadline; no forced trades. Fees are assumptions; FX, spread, slippage and tax may change outcomes.')
 
 refresh = st.button('🔄  SCAN NOW', type='primary', use_container_width=True)
 
@@ -190,9 +190,17 @@ def live_dashboard():
         er = (maker if entry_type == 'Maker' else taker) / 100
         xr = (maker if exit_type == 'Maker' else taker) / 100
 
+        def plan(signal, er, xr):
+            entry, stop, target = signal['entry'], signal['stop'], signal['target']
+            risk = (entry - stop) / entry + er + xr * stop / entry
+            gain = (target - entry) / entry - er - xr * target / entry
+            size = min(capital / (1 + er), max_risk / risk) if risk > 0 else 0.
+            return {'entry': entry, 'stop': stop, 'target': target, 'risk': risk,
+                    'gain': gain, 'size': size, 'rr': gain / risk if risk > 0 else np.nan}
+
         def higher_context(pair):
             if not use_higher:
-                return {'1h trend': None, '4h trend': None, '1d trend': None, 'Higher TF': 'OFF'}
+                return {'1h trend': None, '4h trend': None, '1d trend': None, 'Higher TF': 'OFF', 'Swing signal': 'OFF', 'Swing R:R': np.nan, 'Swing entry': np.nan, 'Swing stop': np.nan, 'Swing target': np.nan, 'Swing position GBP': 0., 'Swing loss GBP': 0., 'Swing gain GBP': 0., 'Swing why': 'Higher-timeframe scanning disabled'}
             hourly = candles(pair, 3600)
             _, h1 = analyse(hourly, 3600)
             # Coinbase Exchange does not support native 4h granularity. Aggregate completed 1h bars.
@@ -205,8 +213,28 @@ def live_dashboard():
             _, h4 = analyse(four, 14400)
             _, day = analyse(candles(pair, 86400), 86400)
             flags = [h1['trend'], h4['trend'], day['trend']]
+            # Swing setup is independent of the 5m trigger. Use 4h volatility and
+            # 4h structure for levels; 1h momentum is an entry-timing check.
+            swing_plan = plan(h4, er, xr)
+            fresh_swing = h1['age'] <= 150 and h4['age'] <= 360 and day['age'] <= 2880
+            trend_ok = h4['trend'] and day['trend']
+            entry_ok = h1['trend'] and h1['momentum'] and 45 <= h1['rsi'] < 75
+            catalyst = h4['breakout'] or h4['sweep']
+            swing_ok = (fresh_swing and trend_ok and entry_ok and catalyst and
+                        swing_plan['gain'] > 0 and swing_plan['rr'] >= 1.5)
+            swing_watch = fresh_swing and trend_ok and entry_ok and not swing_ok
+            swing_status = 'SWING SETUP' if swing_ok else 'SWING WATCH' if swing_watch else 'NONE'
+            why = ('4h volume-backed trigger, 4h+daily trend, 1h timing and net R:R pass' if swing_ok
+                   else '4h+daily trend and 1h timing align; trigger or payoff not qualified' if swing_watch
+                   else 'Higher-timeframe swing conditions not aligned')
             return {'1h trend': flags[0], '4h trend': flags[1], '1d trend': flags[2],
-                    'Higher TF': f"1h {'UP' if flags[0] else 'DOWN'} · 4h {'UP' if flags[1] else 'DOWN'} · 1d {'UP' if flags[2] else 'DOWN'}"}
+                    'Higher TF': f"1h {'UP' if flags[0] else 'DOWN'} · 4h {'UP' if flags[1] else 'DOWN'} · 1d {'UP' if flags[2] else 'DOWN'}",
+                    'Swing signal': swing_status, 'Swing R:R': round(swing_plan['rr'], 2),
+                    'Swing entry': swing_plan['entry'], 'Swing stop': swing_plan['stop'],
+                    'Swing target': swing_plan['target'], 'Swing position GBP': round(swing_plan['size'], 2),
+                    'Swing loss GBP': round(swing_plan['size'] * swing_plan['risk'], 2),
+                    'Swing gain GBP': round(swing_plan['size'] * swing_plan['gain'], 2),
+                    'Swing why': why}
 
         def inspect(pair):
             _, fast = analyse(candles(pair, 300), 300)
@@ -217,6 +245,10 @@ def live_dashboard():
             fresh = fast['age'] <= 10 and slow['age'] <= 30
             aligned = slow['trend'] and slow['momentum'] and 45 <= slow['rsi'] < 75
             higher = higher_context(pair)
+            # A swing signal must pass the same current spread constraint as intraday.
+            if not np.isfinite(spread) or spread > max_spread:
+                higher['Swing signal'] = 'NONE'
+                higher['Swing why'] = 'Spread unavailable or above configured maximum'
             triggered = (fast['breakout'] or fast['sweep']) and fast['trend'] and fast['momentum']
             risk_pct = (fast['entry'] - fast['stop']) / fast['entry'] + er + xr * fast['stop'] / fast['entry']
             profit_pct = (fast['target'] - fast['entry']) / fast['entry'] - er - xr * fast['target'] / fast['entry']
@@ -291,19 +323,39 @@ def live_dashboard():
     watch = int((scan.Status == 'WATCH').sum())
     stale = int((scan.Status == 'STALE').sum())
     up = int(scan['15m uptrend'].sum())
-    st.markdown('### 🚦 LIVE TRADE RADAR')
+    swing_setups = int((scan['Swing signal'] == 'SWING SETUP').sum())
+    swing_watch = int((scan['Swing signal'] == 'SWING WATCH').sum())
+    st.markdown('### 🚦 GROWTH OPPORTUNITY RADAR')
+    st.caption('Goal: £100 → £1,000 (10× stretch) · No deadline · Risk budget per idea: £' + f'{max_risk:.2f}')
     if confirmed:
         st.success(f'🟢 {confirmed} CONFIRMED SCREENING SETUP(S) — verify current quotes and execution costs')
     elif aggressive:
         st.warning(f'🟠 {aggressive} EARLY SETUP(S) — higher risk, 15m confirmation incomplete')
+    elif swing_setups:
+        st.success(f'🟣 {swing_setups} HIGHER-TIMEFRAME SWING SETUP(S) — check execution and research')
     else:
-        st.info('⚪ NO BUY SETUP — no action indicated by current screening rules.')
-    a, b, c = st.columns(3)
-    a.metric('🟢 Confirmed', confirmed)
+        st.info('⚪ NO QUALIFIED BUY SETUP — no action indicated by current screening rules.')
+    a, b, c, d = st.columns(4)
+    a.metric('🟢 Intraday', confirmed)
     b.metric('🟠 Early', aggressive)
-    c.metric('👀 Watch', watch)
+    c.metric('🟣 Swing', swing_setups)
+    d.metric('👀 Watch', watch + swing_watch)
     st.caption(f"{len(scan)} analysed · {up}/{len(scan)} in 15m uptrends · {stale} stale · Checked {st.session_state.scanned_at} UTC")
-    st.markdown('#### 🎯 BEST OPPORTUNITIES')
+    st.markdown('#### 🟣 SWING RADAR · independent of 5m')
+    swing_ranked = scan.loc[scan['Swing signal'].isin(['SWING SETUP', 'SWING WATCH'])].copy()
+    if swing_ranked.empty:
+        st.caption('No swing setups or aligned swing watch candidates in the scanned universe.')
+    else:
+        swing_ranked['_priority'] = swing_ranked['Swing signal'].map({'SWING SETUP': 0, 'SWING WATCH': 1})
+        swing_ranked = swing_ranked.sort_values(['_priority', 'Swing R:R'], ascending=[True, False])
+        for _, candidate in swing_ranked.head(5).iterrows():
+            with st.container(border=True):
+                st.markdown(f"**{candidate['Pair']}** · **{candidate['Swing signal']}** · net R:R {candidate['Swing R:R']}:1")
+                st.caption(candidate['Higher TF'] + ' · ' + candidate['Swing why'])
+                if candidate['Swing signal'] == 'SWING SETUP':
+                    st.markdown(f"Entry **{candidate['Swing entry']:.8g}** · Stop **{candidate['Swing stop']:.8g}** · Target **{candidate['Swing target']:.8g}**")
+                    st.caption(f"Size £{candidate['Swing position GBP']:.2f} · Planned loss £{candidate['Swing loss GBP']:.2f} · Target gain £{candidate['Swing gain GBP']:.2f} (before slippage/FX)")
+    st.markdown('#### ⚡ INTRADAY RADAR')
     shortlist = scan.loc[scan.Status.isin(['CONFIRMED', 'AGGRESSIVE', 'WATCH'])].head(5)
     if shortlist.empty:
         st.caption('No qualifying or watchlist candidates. Next scan runs while the page remains active.')
@@ -319,7 +371,8 @@ def live_dashboard():
 
     tab1, tab2, tab3 = st.tabs(['🏆 RANKINGS', '🔎 CHART LAB', '📥 REPORT'])
     with tab1:
-        st.subheader('Opportunity leaderboard')
+        st.subheader('Intraday leaderboard')
+        st.caption('Swing setups are ranked separately above; the intraday table below does not filter them out.')
         filter_status = st.segmented_control('Show markets', ['All', 'Confirmed', 'Aggressive', 'Watch', 'Avoid', 'Stale'], default='All')
         visible = scan if filter_status == 'All' else scan.loc[scan.Status == filter_status.upper()]
         if visible.empty:
@@ -398,14 +451,14 @@ def live_dashboard():
         report.insert(2, 'Taker fee assumption %', taker)
         report.insert(3, 'Capital GBP', capital)
         report.insert(4, 'Risk budget GBP', max_risk)
-        st.download_button('⬇️ DOWNLOAD V6 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
-                           file_name='coinbase_scanner_v6_report.csv', mime='text/csv', use_container_width=True)
+        st.download_button('⬇️ DOWNLOAD V6.1 MARKET REPORT', report.to_csv(index=False).encode('utf-8'),
+                           file_name='coinbase_scanner_v6_1_report.csv', mime='text/csv', use_container_width=True)
         st.caption('Optional deeper analysis: download and share this report. No account keys or personal data are exported.')
         with st.expander('What do the labels mean?'):
             st.markdown('**CONFIRMED:** a fresh 5m trigger plus 15m confirmation and acceptable costs. **AGGRESSIVE:** a volume-backed early 5m trigger without full 15m confirmation; higher risk. **WATCH:** incomplete confirmation. **AVOID:** bearish conditions. **STALE:** candle data is too old. None of these labels guarantees a trade outcome.')
 
     st.divider()
-    st.caption('Higher timeframes are context, not proof of a trade; 4h bars are aggregated from 1h. Auto-check runs only while this browser session is active; Streamlit may sleep when inactive. Research only. Coinbase Exchange public candles and tickers are snapshots and may differ from Coinbase Advanced prices, listings, fees and execution. No leverage, account access or order placement. Never treat a screening signal as a guaranteed trade.')
+    st.caption('Swing signals are technical research prompts, not independently verified positive-expectancy strategies. No backtest or persistent trade journal is included. Higher timeframes are context, not proof of a trade; 4h bars are aggregated from 1h. Auto-check runs only while this browser session is active; Streamlit may sleep when inactive. Research only. Coinbase Exchange public candles and tickers are snapshots and may differ from Coinbase Advanced prices, listings, fees and execution. No leverage, account access or order placement. Never treat a screening signal as a guaranteed trade.')
 
 
 live_dashboard()
